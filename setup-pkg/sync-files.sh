@@ -18,7 +18,7 @@ echo "=== 同步源码到 $FILES_DIR ==="
 
 # 清空重建
 rm -rf "$FILES_DIR"
-mkdir -p "$FILES_DIR"/{proxy,native,extension}
+mkdir -p "$FILES_DIR"/{proxy,native,extension,skill/references}
 
 # ---------- proxy ----------
 echo "→ proxy/"
@@ -46,9 +46,16 @@ cp "$PROJECT_DIR"/content.js "$FILES_DIR/extension/"
 cp "$PROJECT_DIR"/popup.html "$FILES_DIR/extension/"
 cp "$PROJECT_DIR"/popup.js "$FILES_DIR/extension/"
 
+# ---------- skill ----------
+echo "→ skill/"
+cp "$PROJECT_DIR"/skill/SKILL.md "$FILES_DIR/skill/"
+cp "$PROJECT_DIR"/skill/references/protocol.md "$FILES_DIR/skill/references/"
+# skill 安装时释放到 ~/.agents/skills/jumpserver-term-bridge/，让 Agent 自动发现
+
 # 校验关键文件都在
 for f in proxy/server.js proxy/arthas-guard.js native/install.sh native/host.sh.template \
-         extension/manifest.json extension/background.js extension/content.js extension/popup.html extension/popup.js; do
+         extension/manifest.json extension/background.js extension/content.js extension/popup.html extension/popup.js \
+         skill/SKILL.md skill/references/protocol.md; do
   if [ ! -f "$FILES_DIR/$f" ]; then
     echo "✗ 缺少 $f" >&2
     exit 1

@@ -37,11 +37,12 @@ const c = {
 const log = (msg) => console.log(msg);
 const ok = (msg) => console.log(c.green("✓ ") + msg);
 const fail = (msg) => { console.error(c.red("✗ ") + msg); process.exit(1); };
-const step = (n, msg) => console.log(`\n${c.bold(c.cyan(`[${n}/4]`))} ${msg}`);
+const step = (n, total, msg) => console.log(`\n${c.bold(c.cyan(`[${n}/${total}]`))} ${msg}`);
+const STEPS = 5;
 
 // ===================== 步骤 1：释放文件 =====================
 function releaseFiles() {
-  step(1, `释放文件到 ${c.dim(INSTALL_DIR)}`);
+  step(1, STEPS, `释放文件到 ${c.dim(INSTALL_DIR)}`);
 
   if (!existsSync(FILES_DIR)) {
     fail(`安装包不完整：未找到 ${FILES_DIR}`);
@@ -61,8 +62,9 @@ function releaseFiles() {
 
   mkdirSync(INSTALL_DIR, { recursive: true });
 
-  // 复制三个子目录
-  for (const sub of ["proxy", "native", "extension"]) {
+  // 复制四个子目录（skill 只释放到 ~/.terminal-bridge/skill 备份，
+  // 实际安装到 ~/.agents/skills/ 由 installSkill 负责）
+  for (const sub of ["proxy", "native", "extension", "skill"]) {
     const src = join(FILES_DIR, sub);
     const dst = join(INSTALL_DIR, sub);
     if (!existsSync(src)) {
@@ -75,7 +77,7 @@ function releaseFiles() {
 
 // ===================== 步骤 2：装代理依赖 =====================
 function installProxyDeps() {
-  step(2, "安装代理依赖 (ws)");
+  step(2, STEPS, "安装代理依赖 (ws)");
 
   // 如果 node_modules/ws 已存在（从包里带出来的），跳过
   const wsPath = join(INSTALL_DIR, "proxy", "node_modules", "ws");
@@ -99,7 +101,7 @@ function installProxyDeps() {
 
 // ===================== 步骤 3：注册 native host =====================
 function registerNativeHost() {
-  step(3, "注册 Native Messaging Host");
+  step(3, STEPS, "注册 Native Messaging Host");
 
   // macOS / Linux 路径不同
   const plat = platform();
@@ -135,9 +137,30 @@ function registerNativeHost() {
   return true;
 }
 
-// ===================== 步骤 4：引导加载插件 =====================
+// ===================== 步骤 4：安装 skill =====================
+// 把 skill 释放到 ~/.agents/skills/jumpserver-term-bridge/
+// 这样 Agent（如 ZCode）能自动发现并触发，知道怎么调用桥接、怎么处理各种错误。
+function installSkill() {
+  step(4, STEPS, "安装 Agent skill");
+
+  const skillSrc = join(INSTALL_DIR, "skill");
+  if (!existsSync(skillSrc)) {
+    console.log(c.yellow("  ⚠ 未找到 skill 源文件，跳过（不影响核心功能）"));
+    return;
+  }
+
+  // skill 安装位置：~/.agents/skills/jumpserver-term-bridge/
+  // 这是 ZCode 的用户级 skill 目录，放这里 Agent 能自动发现
+  const skillDest = join(homedir(), ".agents", "skills", "jumpserver-term-bridge");
+  mkdirSync(skillDest, { recursive: true });
+  cpSync(skillSrc, skillDest, { recursive: true, force: true });
+  ok(`skill → ${skillDest}`);
+  console.log(c.dim("  Agent 现在能自动识别 jumpserver/arthas 终端并使用桥接"));
+}
+
+// ===================== 步骤 5：引导加载插件 =====================
 function guideLoadExtension() {
-  step(4, "加载 Chrome 插件");
+  step(5, STEPS, "加载 Chrome 插件");
 
   const extDir = join(INSTALL_DIR, "extension");
   console.log("");
@@ -187,6 +210,7 @@ function main() {
   releaseFiles();
   installProxyDeps();
   registerNativeHost();
+  installSkill();
   guideLoadExtension();
 
   console.log("");
