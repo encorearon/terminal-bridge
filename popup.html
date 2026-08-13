@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body {
+      width: 340px;
+      padding: 12px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 13px;
+      margin: 0;
+    }
+    h3 { margin: 0 0 4px; font-size: 15px; }
+    .subtitle { font-size: 11px; color: #888; margin-bottom: 8px; }
+    button {
+      width: 100%;
+      padding: 9px;
+      margin: 4px 0;
+      cursor: pointer;
+      border: none;
+      border-radius: 5px;
+      font-size: 13px;
+      font-weight: 500;
+      transition: opacity .15s;
+    }
+    button:hover { opacity: .9; }
+    .proxy-start { background: #FF9800; color: white; }
+    .proxy-stop  { background: #795548; color: white; }
+    .scan        { background: #2196F3; color: white; }
+    .status-line {
+      display: flex;
+      align-items: center;
+      font-size: 12px;
+      margin-bottom: 6px;
+    }
+    .dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      margin-right: 6px;
+      flex-shrink: 0;
+    }
+    .dot.on  { background: #4CAF50; }
+    .dot.off { background: #ccc; }
+    .dot.loading { background: #FF9800; animation: pulse 1s infinite; }
+    @keyframes pulse { 50% { opacity: 0.4; } }
+    .section {
+      margin-top: 12px;
+      padding-top: 10px;
+      border-top: 1px solid #e0e0e0;
+    }
+    .section-title {
+      font-size: 11px;
+      color: #888;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 8px;
+    }
+    .hint {
+      font-size: 11px;
+      color: #888;
+      margin-top: 4px;
+      line-height: 1.5;
+    }
+    .tab-item {
+      display: flex;
+      align-items: center;
+      padding: 6px 8px;
+      margin: 3px 0;
+      border-radius: 4px;
+      background: #f5f5f5;
+      font-size: 12px;
+      cursor: pointer;
+      transition: background .15s;
+    }
+    .tab-item:hover { background: #e8e8e8; }
+    .tab-item.active {
+      background: #e3f2fd;
+      border-left: 3px solid #2196F3;
+    }
+    .tab-item .tab-title {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      margin-left: 6px;
+    }
+    .tab-item .tab-check { font-size: 14px; flex-shrink: 0; }
+    .tab-item .tab-host {
+      font-size: 10px;
+      color: #888;
+      background: #e8e8e8;
+      padding: 1px 5px;
+      border-radius: 3px;
+      margin-left: 6px;
+      flex-shrink: 0;
+      max-width: 90px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .tab-item.active .tab-host { background: #bbdefb; color: #1565c0; }
+    .tab-item .tab-current {
+      font-size: 9px;
+      color: #4CAF50;
+      margin-left: 4px;
+      flex-shrink: 0;
+    }
+    .tab-item .tab-info { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+    .tab-item .tab-title {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      margin-left: 6px;
+    }
+    .tab-item .tab-row { display: flex; align-items: center; margin-left: 6px; flex: 1; min-width: 0; }
+    .guide {
+      font-size: 11px;
+      color: #666;
+      line-height: 1.7;
+    }
+    .guide code {
+      background: #f0f0f0;
+      padding: 1px 4px;
+      border-radius: 3px;
+      font-size: 10px;
+    }
+    .guide ol { margin: 4px 0; padding-left: 18px; }
+  </style>
+</head>
+<body>
+  <h3>🔌 终端桥接</h3>
+  <div class="subtitle">JumpServer · Arthas Web Console</div>
+
+  <div class="section" style="margin-top:8px;padding-top:0;border:none;">
+    <div class="status-line">
+      <span class="dot off" id="xtermDot"></span>
+      <span id="xtermStatusText">未检测到终端</span>
+    </div>
+    <div class="hint" id="xtermHint">打开 JumpServer 终端 或 Arthas Console</div>
+    <button class="scan" id="btnXtermScan">🔍 捕捉终端</button>
+    <div id="tabList" style="margin-top:6px;"></div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">桥接代理</div>
+    <div class="status-line">
+      <span class="dot off" id="proxyDot"></span>
+      <span id="proxyStatusText">代理未运行</span>
+    </div>
+    <button class="proxy-start" id="btnProxyStart">🚀 启动代理</button>
+    <button class="proxy-stop"  id="btnProxyStop" style="display:none;">⏹ 停止代理</button>
+    <div class="hint" id="proxyHint">首次使用需先运行 native/install.sh 安装本地宿主</div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">使用说明</div>
+    <div class="guide">
+      <ol>
+        <li>打开终端页面（JumpServer Web 终端 / Arthas Console），完成连接</li>
+        <li>点「🔍 捕捉终端」（灰点变绿）。多开时在下方选目标 tab</li>
+        <li>点「🚀 启动代理」（橙点变绿）</li>
+        <li>两个都绿，Agent 即可通过桥接发命令</li>
+      </ol>
+      <div class="hint" style="margin-top:6px;">
+        ⚠ 交互式命令（vim/less/需密码的 sudo）会超时<br>
+        ⚠ Arthas 高风险命令（retransform/profiler/stop/reset）已禁用
+      </div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

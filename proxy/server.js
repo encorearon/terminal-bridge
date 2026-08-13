@@ -1,0 +1,529 @@
+// JumpServer xterm 桥接代理
+//
+// 在 Agent 和 Chrome 插件之间做"请求-响应"配对：
+//   Agent 发 run{cmd} → 代理把 cmd 包成 `cmd; printf 哨兵\r` → 发给插件
+//   插件注入 xterm → 远端 SSH 执行 → koko WS recv 帧 → 代理在帧流里
+//   匹配到哨兵 → 截取哨兵前的内容作为这条命令的输出 → 返回给 Agent
+//
+// 端点：ws://127.0.0.1:8787/ssh
+// 两类客户端连这个端点：
+//   - 插件 background：上报 ws-recv/ws-send 帧，接收 run-cmd 指令
+//   - Agent：发 run 请求，接收 result 响应
+//   （它们用同一端点，靠消息 type 区分角色）
+
+import { WebSocketServer } from "ws";
+import { randomBytes } from "node:crypto";
+import {
+  auditArthasCommand,
+  isArthasCommand,
+} from "./arthas-guard.js";
+
+const PORT = Number(process.env.PORT || 8787);
+const HOST = process.env.HOST || "127.0.0.1";
+const DEFAULT_TIMEOUT_MS = Number(process.env.DEFAULT_TIMEOUT_MS || 10000);
+const PROBE_LOG = process.env.PROBE_LOG !== "0"; // 默认开探针日志
+
+const TAG = "[proxy]";
+
+// ===================== 客户端管理 =====================
+// 一个端点两类客户端：插件（唯一）和 Agent（多个）。
+// 我们不严格区分谁连进来，靠消息 type 路由。
+const clients = new Set();        // 所有连进来的 ws
+let extensionWs = null;           // 最新一个发过 hello/role:extension 的连接
+
+function broadcast(obj, except = null) {
+  const line = JSON.stringify(obj);
+  for (const c of clients) {
+    if (c === except) continue;
+    if (c.readyState !== c.OPEN) continue;
+    try { c.send(line); } catch {}
+  }
+}
+
+function sendToExtension(obj) {
+  if (extensionWs && extensionWs.readyState === extensionWs.OPEN) {
+    try { extensionWs.send(JSON.stringify(obj)); } catch {}
+    return true;
+  }
+  return false;
+}
+
+// ===================== 请求-响应配对 =====================
+// pending: reqId -> { resolve, timer, buffer, cmd, sentAt }
+//
+// 设计要点：
+//  - 同一时刻只让一个 pending 跑（SSH 单会话命令会交错，必须串行）。
+//    后来的 run 进入 queue，前一个完成（命中哨兵或超时）后才放行。
+//  - 每个 recv 帧追加到当前 pending 的 buffer；buffer 里出现该 reqId 的
+//    哨兵时，切出哨兵之前的内容当输出，resolve 掉。
+const pending = new Map();
+const queue = [];
+let running = false;
+
+function genReqId() {
+  return randomBytes(4).toString("hex");
+}
+
+// Agent 发来的 run 请求
+function handleRun(ws, msg) {
+  const reqId = msg.reqId || genReqId();
+  const cmd = (msg.cmd || "").toString();
+  const timeoutMs = Number(msg.timeoutMs || DEFAULT_TIMEOUT_MS);
+
+  if (!cmd) {
+    ws.send(JSON.stringify({ type: "result", reqId, ok: false, error: "empty cmd" }));
+    return;
+  }
+
+  // ====== Arthas 安全基线审计 ======
+  // 只对 Arthas 命令做拦截（shell 命令不拦）。拦截结果三种：
+  //   allow    —— 放行
+  //   transform —— 自动补安全参数后放行（对 Agent 透明）
+  //   deny     —— 拒绝（高风险命令无条件禁用；中风险超限或缺参数在严格模式下拒绝）
+  let finalCmd = cmd;
+  if (isArthasCommand(cmd)) {
+    const audit = auditArthasCommand(cmd);
+
+    if (audit.action === "deny") {
+      console.warn(TAG, `[guard] 拒绝命令: ${cmd.slice(0, 80)} → ${audit.error}`);
+      ws.send(JSON.stringify({
+        type: "result",
+        reqId,
+        ok: false,
+        error: audit.error,
+        suggest: audit.suggest,
+        message: audit.message,
+      }));
+      return;
+    }
+
+    if (audit.action === "transform") {
+      // 自动改写：用补了安全参数的命令替换原命令
+      console.log(TAG, `[guard] 改写命令: ${cmd.slice(0, 60)} → 补参数 (${audit.reason})`);
+      finalCmd = audit.cmd;
+    }
+  }
+
+  const job = { ws, reqId, cmd: finalCmd, timeoutMs, sentAt: Date.now() };
+  queue.push(job);
+  maybeRunNext();
+}
+
+function maybeRunNext() {
+  if (running) return;
+  const job = queue.shift();
+  if (!job) return;
+
+  running = true;
+
+  // ====== prompt 锚点方案 ======
+  // kitty 终端逐字符注入会重绘，把任何标记字符串（BEGIN/END/哨兵）打散，
+  // 标记方案不可靠。改用 shell prompt 作为命令完成的锚点（expect/pexpect 经典做法）。
+  //
+  // 你的 PS1=[\u@\h \w]\$ 渲染成 [root@k8s-master-test /home/operation]#
+  // 关键：prompt 是服务端 shell 在命令完成后输出的，不受 kitty 输入重绘影响。
+  //
+  // 流程：
+  //   1. 发 cmd + \r
+  //   2. 在 ws-recv 流里累积，找 prompt 正则匹配（]\s*[#$]\s*$ 在行尾）
+  //   3. 第一次匹配到 prompt：说明之前的 buffer 含"上一条命令的尾部 prompt + cmd 回显"，
+  //      从这个 prompt 之后开始才是本命令的输出区域
+  //   4. 第二次匹配到 prompt：命令执行完毕，两个 prompt 之间就是输出
+  const wrapped = `${job.cmd}\r`;
+
+  // 状态机：
+  //   phase 0 (wait_prompt_1) : 等 prompt 第 1 次出现（命令回显前的 prompt）
+  //   phase 1 (wait_prompt_2) : 等 prompt 第 2 次出现（命令完成后的 prompt）
+  const entry = {
+    resolve: (result) => {
+      if (pending.has(job.reqId)) {
+        clearTimeout(entry.timer);
+        pending.delete(job.reqId);
+        try {
+          job.ws.send(JSON.stringify({ type: "result", reqId: job.reqId, ...result }));
+        } catch {}
+      }
+      running = false;
+      setImmediate(maybeRunNext);
+    },
+    timer: null,
+    phase: 0,
+    buffer: "",
+    cmd: job.cmd,
+    promptCount: 0
+  };
+  pending.set(job.reqId, entry);
+  entry.sentAt = job.sentAt;
+
+  // 超时：resolve 失败 + 发 Ctrl+C 复位终端
+  entry.timer = setTimeout(() => {
+    console.warn(TAG, `run [${job.reqId}] timeout (phase=${entry.phase}), sending Ctrl+C to reset terminal`);
+    sendCtrlC();
+    entry.resolve({
+      ok: false,
+      error: "timeout",
+      output: cleanOutput(entry.buffer, entry.cmd),
+      elapsedMs: Date.now() - job.sentAt
+    });
+  }, job.timeoutMs);
+
+  const ok = sendToExtension({ type: "run-cmd", text: wrapped, reqId: job.reqId });
+  if (!ok) {
+    entry.resolve({ ok: false, error: "extension not connected" });
+  } else {
+    console.log(TAG, `run [${job.reqId}] dispatched: ${job.cmd.slice(0, 80)}`);
+  }
+}
+
+// 发 Ctrl+C 复位终端（超时/交互卡死时调用）
+function sendCtrlC() {
+  const ok = sendToExtension({ type: "run-cmd", text: "\x03", reqId: "__ctrlc__" });
+  if (!ok) console.warn(TAG, "Ctrl+C 发送失败：插件未连接");
+}
+
+// ===================== 终端类型感知 =====================
+// 截断根因：原来用单一 PROMPT_RE = /\]\s*[#$]\s*$|>\s*$/，其中 >\s*$ 太宽——
+// JumpServer 输出里只要某行以 > 结尾（JSON 片段、shell 重定向、日志）就会被误判成
+// Arthas prompt，导致代理提前认为命令结束、resolve 返回，后面的输出全丢。
+//
+// 根治：自动探测终端类型，按类型选 prompt 正则。
+//   - jumpserver (koko/SSH): prompt = [user@host dir]# 或 ]$，只认 ]\s*[#$]\s*$
+//   - arthas: prompt = arthas@pid>，只认 arthas@\S+>\s*$
+//   - unknown（探测未出结果前）: 用宽松兜底，保持向后兼容
+//
+// 探测依据：koko 和 Arthas 的 prompt 特征泾渭分明。
+// 每条 ws-recv 帧喂给 detectTerminalType()，命中特征即锁定类型（一旦锁定不再改）。
+
+let terminalType = "unknown";  // "unknown" | "jumpserver" | "arthas"
+
+// 各类型的 prompt 正则
+const PROMPT_RE_BY_TYPE = {
+  // JumpServer shell prompt：[user@host /dir]# 或 ]$
+  // 注意：不匹配裸 >，避免输出内容里的 > 行误触发
+  jumpserver: /\]\s*[#$]\s*$/,
+  // Arthas prompt：arthas@pid>（带 arthas@ 前缀，不匹配裸 >）
+  arthas: /arthas@\S+>\s*$/,
+  // 未知类型：宽松兜底（探测完成前的窗口期，行为同旧版）
+  unknown: /\]\s*[#$]\s*$|>\s*$/,
+};
+
+// 旧名保留（cleanOutput 等处仍引用），指向宽松兜底，仅用于"删 prompt 行"的清理逻辑
+const PROMPT_RE = PROMPT_RE_BY_TYPE.unknown;
+
+// 探测终端类型：扫描 ANSI 清理后的文本，按 prompt 特征判定
+// 支持切换：如果已锁定类型 A，但检测到明确的类型 B 特征，则切换到 B
+// （用户在 popup 切 tab 从 Arthas 切到 JumpServer 时，代理靠这条路径纠正）
+function detectTerminalType(text) {
+  const clean = text
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, "");
+
+  // Arthas prompt 特征：arthas@<pid>> （出现在任意行尾）
+  if (/arthas@\S+>\s*$/m.test(clean)) {
+    if (terminalType !== "arthas") {
+      terminalType = "arthas";
+      console.log(TAG, "[probe] 终端类型切换 → arthas（检测到 arthas@pid> prompt）");
+    }
+    return;
+  }
+
+  // JumpServer shell prompt 特征：[user@host /dir]# 或 ]$
+  if (/\[[^\]\n]+@[^\]\n]+\][^\n]*[#$]\s*$/m.test(clean)) {
+    if (terminalType !== "jumpserver") {
+      terminalType = "jumpserver";
+      console.log(TAG, "[probe] 终端类型切换 → jumpserver（检测到 [user@host]# prompt）");
+    }
+    return;
+  }
+  // 未命中任一特征，保持当前类型不变
+}
+
+// 插件上报的 ws-recv 帧
+function handleWsRecv(payload) {
+  const data = payload && payload.data;
+  const opcode = payload && payload.opcode;
+
+  // ---------- 探针日志 ----------
+  // 第一次见到 recv 帧时，把原始数据形态打到日志，便于判断 koko 走文本还是二进制
+  if (PROBE_LOG && !probeSeen) {
+    probeSeen = true;
+    probeLog(data, opcode);
+  }
+
+  if (data == null || data === "") return;
+
+  // 关键：opcode=2（二进制帧）时，CDP 返回的 payloadData 是 base64 字符串，
+  // 解码后才是真实的终端明文（koko 走二进制帧，但 payload 是普通 SSH PTY 文本）。
+  // opcode=1（文本帧）时 data 本身就是明文。
+  // 探针实测：koko 是 opcode=2，base64 解码后能看到 echo 回显、ANSI、哨兵等明文。
+  let text;
+  if (opcode === 2 && typeof data === "string") {
+    try {
+      text = Buffer.from(data, "base64").toString("utf8");
+    } catch {
+      text = data; // 解码失败兜底，至少能匹配 base64 形式的哨兵（几乎不会发生）
+    }
+  } else {
+    text = typeof data === "string" ? data : String(data);
+  }
+
+  // 给当前 pending（同时只会有一个）喂帧，按 prompt 锚点状态机处理
+  for (const [reqId, entry] of pending) {
+    entry.buffer += text;
+
+    // 终端类型探测：每帧喂一次，一旦锁定就不再改
+    // 在 prompt 匹配之前做，确保本帧用到的正则已是正确类型
+    detectTerminalType(text);
+
+    // 按探测到的终端类型选 prompt 正则（截断根治的核心）
+    const activePromptRE = PROMPT_RE_BY_TYPE[terminalType];
+
+    // 在 ANSI 清理后的文本上找 prompt。注意：kitty 可能逐字符推送，
+    // prompt 可能跨多个 ws-recv 帧才完整，所以每次都重新扫整个 buffer 尾部。
+    // 为了避免重复计数同一个 prompt，记录上次扫描的长度。
+    if (entry.lastScanLen === undefined) entry.lastScanLen = 0;
+    if (entry.buffer.length <= entry.lastScanLen) continue;
+
+    // 只扫描新增部分 + 一点重叠（prompt 可能跨帧，重叠 64 字符足够覆盖一个 prompt）
+    const scanFrom = Math.max(0, entry.lastScanLen - 64);
+    const newPart = entry.buffer.slice(scanFrom);
+
+    // ANSI 清理后判断行尾是否是 prompt
+    // 用"找换行后的 prompt 模式"：prompt 总是出现在某行行尾
+    const cleanNew = newPart
+      .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+      .replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, "");
+
+    // 找所有以 ]# 或 ]$ 结尾的位置（prompt）
+    // cleanNew 是新片段，它的行尾可能是 prompt
+    // 但更可靠：检查清理后整个 buffer 的尾部
+    const cleanFull = entry.buffer
+      .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+      .replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, "");
+
+    // ====== sudo 密码提示实时检测（优先于 prompt 检测）======
+    // 一旦发现 [sudo] password for / Sorry, try again / [sudo] password for root
+    // 立即失败 + Ctrl+C 复位，返回特殊错误让 Agent 询问用户是否切 root。
+    // 不等超时——sudo 提示是交互式的，等 10s 没意义。
+    const sudoPatterns = [
+      /\[sudo\] password for /,
+      /Sorry, try again\./,
+      /sudo: /,
+    ];
+    const sudoHit = sudoPatterns.some(re => re.test(cleanFull));
+    if (sudoHit) {
+      console.warn(TAG, `[DEBUG ${reqId}] sudo prompt detected, auto Ctrl+C + return sudo-required`);
+      sendCtrlC();
+      entry.resolve({
+        ok: false,
+        error: "sudo-required",
+        suggest: "sudo su root",
+        message: "命令触发了 sudo 密码提示（可能是 alias 劫持）。是否切换到 root 后重试？",
+        elapsedMs: Date.now() - entry.sentAt
+      });
+      continue;  // 已 resolve，跳过后续 prompt 检测
+    }
+
+    // 检查清理后 buffer 的尾部是否以 prompt 结尾
+    // 用按终端类型选出的正则（截断根治：jumpserver 不再被裸 > 误触发）
+    const tail = cleanFull.slice(-200);
+    const promptMatch = tail.match(activePromptRE);
+    if (promptMatch) {
+      entry.promptCount = (entry.promptCount || 0) + 1;
+      entry.lastScanLen = entry.buffer.length;
+
+      if (entry.phase === 0) {
+        // 注：终端在我们注入命令前就已经处于 prompt 状态，但那个 prompt 字节
+        // 早已流过（attach 之前）。我们注入 cmd 后，第一个出现的 prompt 就是
+        // 命令完成后的 prompt。所以只需等 1 个 prompt。
+        // buffer 里 = kitty 重绘碎片 + cmd 回显 + 真实输出 + 最终 prompt
+        // 切掉末尾 prompt，前面的内容交给 cleanOutput 清理（删 prompt 行、碎片）
+        const output = cleanOutput(entry.buffer, entry.cmd);
+        entry.resolve({
+          ok: true,
+          output,
+          elapsedMs: Date.now() - entry.sentAt
+        });
+      }
+    }
+  }
+}
+
+// ===================== 探针 =====================
+let probeSeen = false;
+function probeLog(data, opcode) {
+  console.log("=".repeat(60));
+  console.log(TAG, "[PROBE] 首个 ws-recv 帧已到达");
+  console.log(TAG, `[PROBE] opcode = ${opcode} (${opcode === 2 ? "二进制帧" : opcode === 1 ? "文本帧" : "其他"})`);
+  console.log(TAG, `[PROBE] 原始 payloadData（前 120 字符）: ${JSON.stringify(typeof data === "string" ? data.slice(0, 120) : String(data))}`);
+
+  // 对二进制帧展示 base64 解码后的内容
+  if (opcode === 2 && typeof data === "string") {
+    try {
+      const decoded = Buffer.from(data, "base64").toString("utf8");
+      const sample = decoded.slice(0, 200);
+      const looksText = /^[\x09\x0a\x0d\x1b\x20-\x7e]*$/.test(sample);
+      console.log(TAG, `[PROBE] base64 解码后（前 200 字符）: ${JSON.stringify(sample)}`);
+      console.log(TAG, `[PROBE] 解码后是否可打印 ASCII（含 ANSI）: ${looksText}`);
+      console.log(TAG, looksText
+        ? "[PROBE] 结论：二进制帧，但 payload 是明文终端流（已自动解码）"
+        : "[PROBE] 结论：真正的二进制协议，需要专门的解析器");
+    } catch (e) {
+      console.log(TAG, "[PROBE] base64 解码失败:", e.message);
+    }
+  }
+  console.log("=".repeat(60));
+}
+
+// ===================== 输出清理 =====================
+// prompt 锚点方案：buffer = kitty 重绘碎片 + cmd 回显 + 真实输出 + 最终 prompt
+// 清理策略：
+//   1. 去 ANSI（颜色、OSC 标题）
+//   2. 删含 prompt 模式的行（命令回显行，含粘在前面的碎片）
+// 注：kitty 重绘碎片（cmd 文本的片段）可能残留几行，但不影响 Agent 理解输出。
+// 不做 cmd 子串清理——它会误删真实输出（如 cmd="echo hello"，输出"hello"会被删）。
+function cleanOutput(text, cmd) {
+  if (!text) return "";
+  let out = text
+    // ANSI CSI 序列：ESC [ ... 字母（颜色、光标移动、清行等）
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    // ANSI OSC 序列：ESC ] ... BEL 或 ESC \（标题设置等）
+    .replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, "")
+    // \r\n 和孤立 \r → \n
+    .replace(/\r\n?/g, "\n");
+
+  // 删除 prompt 行：
+  //   - shell 风格：行里出现 [user@host /cwd]# 或 ]$ → 整行删
+  //     （删 "[root@host ~]# echo hello" 这种命令回显行，含粘在前面的碎片）
+  //   - Arthas 风格：行尾是 arthas@xxx> 或单独的 > → 整行删
+  out = out.split("\n").filter(line => {
+    if (/\[[^\]\n]+@[^\]\n]+\][^\n]*[#$]/.test(line)) return false;
+    // Arthas / 通用 REPL prompt：行尾 > （允许前面有 arthas@xxx 等前缀）
+    if (/>\s*$/.test(line) && line.trim().length <= 60) return false;
+    return true;
+  }).join("\n");
+
+  // 删除 koko 控制消息：koko 偶尔在终端流里发送 JSON 控制消息
+  // （TERMINAL_RESIZE、PING 等），特征是以 {"id": 开头的 JSON 行（可能前面带 # ）
+  out = out.split("\n").filter(line => {
+    const t = line.trim();
+    if (/^#?\s*\{"id":/.test(t) && /"type":/.test(t)) return false;
+    return true;
+  }).join("\n");
+
+  // 删除命令回显行：整行（去空白后）等于 cmd 的行
+  // 注意是精确匹配整行，不是子串——避免误删真实输出
+  if (cmd) {
+    const cmdNoWs = cmd.replace(/\s+/g, "");
+    out = out.split("\n").filter(line => {
+      const lineNoWs = line.replace(/\s+/g, "");
+      return lineNoWs !== cmdNoWs;
+    }).join("\n");
+  }
+
+  return out
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+// ===================== WebSocket 服务 =====================
+const wss = new WebSocketServer({ host: HOST, port: PORT });
+
+wss.on("connection", (ws, req) => {
+  const url = req.url || "/ssh";
+  if (!url.startsWith("/ssh")) {
+    // 本代理只暴露 /ssh 端点，其他路径直接关
+    ws.close(4000, "unknown endpoint");
+    return;
+  }
+
+  clients.add(ws);
+  console.log(TAG, `client connected (total=${clients.size}) url=${url}`);
+
+  ws.on("message", (raw) => {
+    const text = raw.toString("utf8").trim();
+    if (!text) return;
+    let msg;
+    try { msg = JSON.parse(text); } catch {
+      console.error(TAG, "无法解析:", text.slice(0, 200));
+      return;
+    }
+
+    // --- 插件 hello ---
+    if (msg.type === "hello") {
+      if (msg.payload && msg.payload.role === "extension") {
+        extensionWs = ws;
+        console.log(TAG, "extension 已连接");
+      }
+      ws.send(JSON.stringify({ type: "hello-ack", payload: { ok: true } }));
+      return;
+    }
+
+    // --- Agent 发来的 run 请求 ---
+    if (msg.type === "run") {
+      handleRun(ws, msg);
+      return;
+    }
+
+    // --- 插件上报的 WS 帧 ---
+    if (msg.type === "ws-recv") {
+      handleWsRecv(msg.payload);
+      return;
+    }
+    if (msg.type === "ws-send") {
+      // 调试用，暂不处理（命令是我们自己注入的，不用回放）
+      return;
+    }
+    if (msg.type === "ws-open") {
+      console.log(TAG, "koko WS 连接已建立:", msg.payload && msg.payload.url);
+      return;
+    }
+    if (msg.type === "inject-failed") {
+      console.error(TAG, "插件注入失败:", msg.payload);
+      // 把对应 pending 失败掉
+      const reqId = msg.payload && msg.payload.reqId;
+      if (reqId && pending.has(reqId)) {
+        pending.get(reqId).resolve({
+          ok: false,
+          error: msg.payload.error || "inject failed"
+        });
+      }
+      return;
+    }
+
+    // 未知消息：忽略（避免 ping/pong 等噪音刷屏）
+  });
+
+  ws.on("close", () => {
+    clients.delete(ws);
+    if (ws === extensionWs) {
+      extensionWs = null;
+      console.log(TAG, "extension 已断开");
+      // 失败所有 pending（没有插件就没法拿输出了）
+      for (const [, entry] of pending) {
+        entry.resolve({ ok: false, error: "extension disconnected" });
+      }
+    } else {
+      console.log(TAG, `client disconnected (total=${clients.size})`);
+    }
+  });
+
+  ws.on("error", (err) => console.error(TAG, "ws error:", err.message));
+});
+
+wss.on("listening", () => {
+  const { address, port } = wss.address();
+  console.log(TAG, `监听 ws://${address}:${port}/ssh`);
+  console.log(TAG, "等待插件连接（role: extension）和 Agent 连接（发 run 请求）");
+});
+
+function shutdown() {
+  console.error(TAG, "shutting down");
+  wss.clients.forEach((c) => c.close(1001, "shutting down"));
+  for (const [, entry] of pending) {
+    clearTimeout(entry.timer);
+  }
+  setTimeout(() => process.exit(0), 100);
+}
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);

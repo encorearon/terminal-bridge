@@ -1,0 +1,5 @@
+#!/bin/bash
+# Native messaging host 启动 wrapper
+# 由安装脚本（install.sh / npx 包）生成，__NODE_BIN__ 和 __HOST_JS__ 会被替换成实际路径
+# 用绝对路径调 node，避免 Chrome 启动时 PATH 不全找不到 node
+exec __NODE_BIN__ __HOST_JS__

@@ -1,0 +1,24 @@
+# 依赖
+node_modules/
+proxy/node_modules/
+**/node_modules/
+
+# 运行时产物
+proxy/.proxy.pid
+proxy/.proxy.log
+*.log
+
+# 由安装脚本生成的文件（含本机绝对路径，不进 git）
+# 保留 .template 版本，host.sh 和 com.wssniffer.host.json 由 install.sh 生成
+native/host.sh
+native/com.wssniffer.host.json
+
+# 构建产物（dist 由打包脚本生成）
+dist/
+
+# IDE / 编辑器
+.zcode/
+.vscode/
+.idea/
+*.swp
+.DS_Store
