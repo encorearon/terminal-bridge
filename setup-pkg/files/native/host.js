@@ -79,6 +79,21 @@ function isPidAlive(pid) {
   } catch { return false; }
 }
 
+// 通过端口找占用进程的 PID（PID 文件缺失时的回退方案）
+// 用 lsof -ti :port 拿监听该端口的进程 PID
+function findPidByPort(port) {
+  return new Promise((resolve) => {
+    const child = spawn("lsof", ["-ti", `-i:${port}`, "-sTCP:LISTEN"], { stdio: ["ignore", "pipe", "ignore"] });
+    let out = "";
+    child.stdout.on("data", (d) => { out += d.toString(); });
+    child.on("error", () => resolve(null));      // lsof 不存在或没权限
+    child.on("close", () => {
+      const pid = parseInt(out.trim().split("\n")[0], 10);
+      resolve(isNaN(pid) ? null : pid);
+    });
+  });
+}
+
 // ============== 命令处理 ==============
 async function startProxy() {
   // 已在运行？
@@ -120,24 +135,41 @@ async function startProxy() {
 
 function stopProxy() {
   return new Promise(async (resolve) => {
-    const pid = readPid();
+    let pid = readPid();
+    let pidSource = pid ? "pid file" : null;
+
+    // PID 文件缺失 → 回退用 lsof 按端口找
     if (!pid) {
-      // 没有 PID 文件，但端口可能在监听（手动启动的），尝试用 lsof 找
       const up = await isProxyListening();
-      resolve(up
-        ? { ok: false, status: "running", msg: "无法停止：PID 文件缺失（可能是手动启动的代理），请手动 kill" }
-        : { ok: true, status: "stopped", msg: "proxy was not running" });
-      return;
+      if (!up) {
+        resolve({ ok: true, status: "stopped", msg: "proxy was not running" });
+        return;
+      }
+      pid = await findPidByPort(PROXY_PORT);
+      pidSource = pid ? "port lookup" : null;
+      if (!pid) {
+        resolve({ ok: false, status: "running", msg: "无法停止：代理在监听但找不到 PID（lsof 失败），请手动 kill" });
+        return;
+      }
     }
+
     try {
       process.kill(pid, "SIGTERM");
       // 等 2s 确认退出
-      setTimeout(() => {
+      setTimeout(async () => {
         if (isPidAlive(pid)) {
           try { process.kill(pid, "SIGKILL"); } catch {}
         }
         clearPid();
-        resolve({ ok: true, status: "stopped", msg: "proxy stopped" });
+        // 再确认端口确实释放了
+        const stillUp = await isProxyListening();
+        resolve({
+          ok: !stillUp,
+          status: stillUp ? "running" : "stopped",
+          msg: stillUp
+            ? `SIGTERM+SIGKILL 已发（PID ${pid} via ${pidSource}）但端口仍被占用，可能有其他进程`
+            : `proxy stopped (PID ${pid} via ${pidSource})`,
+        });
       }, 2000);
     } catch (err) {
       clearPid();
