@@ -1,0 +1,17 @@
+{
+  "name": "terminal-bridge-setup",
+  "version": "2.0.0",
+  "description": "一次性安装器：释放终端桥接（JumpServer / Arthas）的本地代理 + Chrome 插件，并注册 native messaging host。",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "terminal-bridge-setup": "./bin/setup.mjs"
+  },
+  "files": [
+    "bin",
+    "files"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "com.wssniffer.host",
+  "description": "Terminal bridge native messaging host",
+  "path": "__HOST_SH__",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://__EXTENSION_ID__/"
+  ]
+}

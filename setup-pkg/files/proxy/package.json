@@ -1,0 +1,15 @@
+{
+  "name": "ws-sniffer-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "JumpServer xterm 桥接代理：Agent <-> Chrome 插件，请求-响应配对",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "example": "node client-example.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
