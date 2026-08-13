@@ -288,7 +288,9 @@ function connectBridge() {
 
 // ============== 手动扫描 xterm（popup 触发）==============
 // 遍历所有 tab 的所有 frame，发 term-ping 探测有没有 xterm。
-// 找到就登记到 termReadyTabs 并 attach debugger，免去刷新页面的麻烦。
+// 关键：reload 插件后已打开的页面里没有 content script，ping 无人响应。
+// 所以 ping 失败时用 chrome.scripting 主动注入 content.js，再 ping 一次。
+// 这样用户 reload 插件后不用刷新页面，点「捕捉终端」就能自动恢复。
 async function scanAllTabsForXterm() {
   const tabs = await chrome.tabs.query({});
   let found = 0;
@@ -306,26 +308,25 @@ async function scanAllTabsForXterm() {
     } catch { continue; }
     if (!frames) continue;
 
-    // 对每个 frame 发 term-ping（必须指定 frameId 才能到 iframe）
     for (const frame of frames) {
-      const res = await new Promise((resolve) => {
-        chrome.tabs.sendMessage(
-          tab.id,
-          { type: "term-ping" },
-          { frameId: frame.frameId },
-          (r) => {
-            if (chrome.runtime.lastError) { resolve(null); return; }
-            resolve(r);
-          }
-        );
-      });
+      // 第一次 ping（content script 可能已经在跑）
+      let res = await pingFrame(tab.id, frame.frameId);
+
+      // ping 失败：content script 没注入（reload 插件后常见）→ 主动注入再 ping
+      if (!res) {
+        console.log("[bg] ping 失败，尝试注入 content.js 到 tab", tab.id, "frame", frame.frameId);
+        await injectContentScript(tab.id, frame.frameId);
+        // 注入后等一下让 IIFE 执行 + term-ping 监听器注册
+        await new Promise(r => setTimeout(r, 200));
+        res = await pingFrame(tab.id, frame.frameId);
+      }
+
       if (res && res.ready) {
         found++;
         termReadyTabs.add(tab.id);
-        termReadyFrames.set(tab.id, frame.frameId);  // 记下 frame，注入时直接用
+        termReadyFrames.set(tab.id, frame.frameId);
         foundTabs.push({ tabId: tab.id, href: res.href });
         console.log("[bg] 扫描发现 xterm: tab", tab.id, "frame", frame.frameId, res.href);
-        // 自动 attach
         attachDebugger(tab.id);
         break;  // 一个 tab 找到一个就够
       }
@@ -339,6 +340,39 @@ async function scanAllTabsForXterm() {
     ready: termReadyTabs.size > 0,
     tabCount: termReadyTabs.size
   };
+}
+
+// 向指定 frame 发 term-ping
+function pingFrame(tabId, frameId) {
+  return new Promise((resolve) => {
+    try {
+      chrome.tabs.sendMessage(
+        tabId,
+        { type: "term-ping" },
+        { frameId },
+        (r) => {
+          if (chrome.runtime.lastError) { resolve(null); return; }
+          resolve(r);
+        }
+      );
+    } catch { resolve(null); }
+  });
+}
+
+// 用 chrome.scripting 主动注入 content.js 到指定 frame
+// 解决 reload 插件后已打开页面没有 content script 的问题
+async function injectContentScript(tabId, frameId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [frameId] },
+      files: ["content.js"],
+    });
+    return true;
+  } catch (err) {
+    // 有些 frame（如 about:blank）注入会失败，忽略
+    console.log("[bg] 注入 content.js 失败 tab", tabId, "frame", frameId, ":", err.message);
+    return false;
+  }
 }
 
 function sendToBridge(obj) {
@@ -401,13 +435,33 @@ async function injectToXterm(text, reqId) {
       return;
     }
 
+    // 第一轮：ping 现有 content script
     for (const frame of frames) {
       const r = await sendToFrame(tabId, frame.frameId, text, reqId, true /*pingOnly*/);
       if (r) {
         targetFrameId = frame.frameId;
-        termReadyFrames.set(tabId, targetFrameId); // 记下来，下次直接用
+        termReadyFrames.set(tabId, targetFrameId);
         ok = await sendToFrame(tabId, targetFrameId, text, reqId);
         break;
+      }
+    }
+
+    // 第二轮：第一轮全失败说明 content script 没注入（reload 插件后常见）
+    // 主动注入 content.js 到每个 frame，再 ping + 注入
+    if (!ok) {
+      console.log("[bg] 降级探测全失败，尝试主动注入 content.js");
+      for (const frame of frames) {
+        await injectContentScript(tabId, frame.frameId);
+      }
+      await new Promise(r => setTimeout(r, 200));  // 等 IIFE 执行
+      for (const frame of frames) {
+        const r = await sendToFrame(tabId, frame.frameId, text, reqId, true /*pingOnly*/);
+        if (r) {
+          targetFrameId = frame.frameId;
+          termReadyFrames.set(tabId, targetFrameId);
+          ok = await sendToFrame(tabId, targetFrameId, text, reqId);
+          break;
+        }
       }
     }
   }

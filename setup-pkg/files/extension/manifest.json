@@ -4,7 +4,7 @@
   "version": "2.0.0",
   "description": "桥接 JumpServer Web 终端，让 Agent 能远程执行命令并获取输出",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtsnqR6PcFUueZwYria79tVbstvjk+tM7PpvIXILm5xbd6bAdjDIhzg3lsnKioVfvxjfvT+s6vJsiOYa9ojVZyJMFc5m/05TYqr770ovYwQmz0e88fmiy6dUoSulbtKvBCSLbN6OOL7u+ul8ixLZ/HautxSmou/eNgAFPmhE+4UueE7wfCqcgMYvjLvEzlqTVumMW+5LKw9YsRk6WhHPghY1a3MVUn3eQOWXBtQTEUy3wBM3v4wHxLwDeinVOR4f/P87IlUNo84C5DeimoFit0qCj3K04hS8MIYCLCYZc3v9ftRJDJBkAoah6Eaqj7JajbS3KvLR1ctOYfDhubgmURQIDAQAB",
-  "permissions": ["debugger", "tabs", "alarms", "webNavigation", "nativeMessaging"],
+  "permissions": ["debugger", "tabs", "alarms", "webNavigation", "nativeMessaging", "scripting"],
   "background": {
     "service_worker": "background.js"
   },
