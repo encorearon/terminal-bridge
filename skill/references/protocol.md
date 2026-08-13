@@ -129,7 +129,7 @@ const PROMPT_RE = /\]\s*[#$]\s*$|>\s*$/;
 
 | 终端 | prompt 样式 | 匹配部分 |
 |------|------------|---------|
-| JumpServer (shell) | `[root@k8s-master /home/op]#` 或 `]$` | `]\s*[#$]\s*$` |
+| JumpServer (shell) | `[root@host /path]#` 或 `]$` | `]\s*[#$]\s*$` |
 | Arthas | `arthas@pid>` 或 `[arthas@...]` | `>\s*$` |
 
 注意：单独的 `>` 较宽（命令输出里 `>` 偶尔出现），但配合"行尾 + ANSI 清理后 + 注入命令后才出现"三个条件，误判率可接受。

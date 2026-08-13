@@ -120,7 +120,7 @@ function maybeRunNext() {
   // kitty 终端逐字符注入会重绘，把任何标记字符串（BEGIN/END/哨兵）打散，
   // 标记方案不可靠。改用 shell prompt 作为命令完成的锚点（expect/pexpect 经典做法）。
   //
-  // 你的 PS1=[\u@\h \w]\$ 渲染成 [root@k8s-master-test /home/operation]#
+  // 典型 shell prompt: [root@host /path]# 或 [user@host ~]$
   // 关键：prompt 是服务端 shell 在命令完成后输出的，不受 kitty 输入重绘影响。
   //
   // 流程：
