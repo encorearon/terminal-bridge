@@ -20,7 +20,7 @@ npx terminal-bridge-setup
 
 > **本地开发/内部分发**（未发布到 npm 时）：
 > ```bash
-> git clone <repo> && cd ws-sniffer
+> git clone <repo> && cd terminal-bridge
 > bash setup-pkg/sync-files.sh        # 同步源码到包目录
 > node setup-pkg/bin/setup.mjs         # 运行安装器
 > ```

@@ -45,7 +45,7 @@ Agent (命令)
 ## 目录结构
 
 ```
-ws-sniffer/
+terminal-bridge/
 ├── manifest.json          # Chrome 插件清单 (MV3)
 ├── background.js          # Service Worker：CDP 抓帧 + 连代理 + 路由命令
 ├── content.js             # 注入 xterm 命令（兼容 koko iframe / Arthas 顶层文档）

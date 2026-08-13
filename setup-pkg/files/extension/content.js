@@ -1,4 +1,4 @@
-// WS Sniffer - content script (ISOLATED world).
+// Terminal Bridge - content script (ISOLATED world).
 //
 // 注：manifest 用 matches: <all_urls> + all_frames:true + run_at:document_start
 // 注入，是为了确保能进终端 frame（koko connect iframe / Arthas console 顶层文档等）。
@@ -13,10 +13,10 @@
 // observer 只监听 documentElement 的 childList，开销可忽略。
 
 (function () {
-  const TAG = "[ws-sniffer-cs]";
+  const TAG = "[terminal-bridge-cs]";
 
-  if (window.__wsSnifferContentLoaded) return;
-  window.__wsSnifferContentLoaded = true;
+  if (window.__terminalBridgeContentLoaded) return;
+  window.__terminalBridgeContentLoaded = true;
 
   // ---------- xterm 定位 ----------
   function findXtermTextarea() {

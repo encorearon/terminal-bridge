@@ -556,4 +556,4 @@ chrome.alarms.onAlarm.addListener(() => {
 
 // ============== 启动 ==============
 connectBridge();
-console.log('[WS Sniffer] background 已启动');
+console.log('[Terminal Bridge] background 已启动');

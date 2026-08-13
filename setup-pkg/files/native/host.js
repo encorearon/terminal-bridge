@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// WS Sniffer Native Messaging Host
+// Terminal Bridge Native Messaging Host
 //
 // Chrome 通过 native messaging 和这个脚本通信（stdin/stdout，4 字节小端长度前缀）。
 // 职责：接收插件命令，启动/停止/查询 proxy/server.js。

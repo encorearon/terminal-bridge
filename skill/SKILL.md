@@ -91,17 +91,17 @@ Arthas 的能力不止于读，以下命令/用法一律禁止通过桥接执行
 lsof -i:8787 | grep LISTEN
 
 # 2. 没跑就启动（也可从插件 popup 的"启动代理"按钮启动）
-cd ~/Code/testwork/ws-sniffer/proxy && node server.js &
+cd ~/.terminal-bridge/proxy && node server.js &
 ```
 
 浏览器侧（任选其一或都开）：
-- **JumpServer**：WS Sniffer 插件已加载 + JumpServer 终端页面已打开 + 已连上一个资产（终端可见、能敲字）
-- **Arthas**：WS Sniffer 插件已加载 + Arthas Console 页面已打开 + 已 Connect 上目标 JVM
+- **JumpServer**：Terminal Bridge 插件已加载 + JumpServer 终端页面已打开 + 已连上一个资产（终端可见、能敲字）
+- **Arthas**：Terminal Bridge 插件已加载 + Arthas Console 页面已打开 + 已 Connect 上目标 JVM
 
 多终端场景：如果同时开了 JumpServer 和 Arthas 两个 tab，代理命令只会发给 popup 里"当前选中"的那个 tab。切换用 popup 的 tab 选择器，或让用户在 popup 点选。
 
 如果用户说"命令没反应"或"inject-failed"：
-1. `chrome://extensions/` 刷新 WS Sniffer 插件 ↻
+1. `chrome://extensions/` 刷新 Terminal Bridge 插件 ↻
 2. 让用户在终端页面按 F5 刷新（让 content script 重新识别 xterm）
 3. 让用户在 popup 点"捕捉 xterm"按钮（手动扫描，免刷新）
 4. 确认终端 tab 顶部有黄色调试条（说明 CDP 已 attach）
@@ -113,7 +113,7 @@ cd ~/Code/testwork/ws-sniffer/proxy && node server.js &
 最简方式（用示例客户端）：
 
 ```bash
-cd ~/Code/testwork/ws-sniffer/proxy
+cd ~/.terminal-bridge/proxy
 
 # JumpServer 场景
 node client-example.mjs "uname -a"
