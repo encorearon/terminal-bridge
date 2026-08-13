@@ -1,6 +1,6 @@
 {
   "name": "terminal-bridge-setup",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "一次性安装器：释放终端桥接（JumpServer / Arthas）的本地代理 + Chrome 插件，并注册 native messaging host。让 Agent 能通过浏览器 xterm 终端执行命令并拿回输出。",
   "license": "MIT",
   "author": "encorearon",

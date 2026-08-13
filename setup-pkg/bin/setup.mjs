@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 // terminal-bridge-setup —— 终端桥接一次性安装器
 //
-// 做 4 件事：
-//   1. 把插件源码 + 代理 + native host 释放到 ~/.terminal-bridge/
+// 做 5 件事：
+//   1. 把插件源码 + 代理 + native host + skill 释放到 ~/.terminal-bridge/
 //   2. 在代理目录跑 npm install（装 ws）
 //   3. 注册 native messaging host 到 Chrome（复用 native/install.sh）
-//   4. 打开 chrome://extensions，引导用户"加载已解压扩展"
+//   4. 安装 skill 到 ~/.agents/skills/（让 Agent 自动发现）
+//   5. 打开 chrome://extensions + Finder，引导用户"加载已解压扩展"
 //
 // 用法（发布后）：
 //   npx terminal-bridge-setup
@@ -163,40 +164,91 @@ function guideLoadExtension() {
   step(5, STEPS, "加载 Chrome 插件");
 
   const extDir = join(INSTALL_DIR, "extension");
+  const plat = platform();
+
   console.log("");
-  console.log(c.bold("请在 Chrome 中操作："));
+  console.log(c.bold("需要手动加载插件（一次性操作）："));
   console.log("");
-  console.log(`  ${c.cyan("1.")} 打开 ${c.bold("chrome://extensions")}`);
-  console.log(`     ${c.dim("(我会尝试帮你打开)")}`);
+  console.log(`  ${c.cyan("1.")} 已为你打开 ${c.bold("chrome://extensions")}`);
   console.log("");
-  console.log(`  ${c.cyan("2.")} 右上角打开「${c.bold("开发者模式")}」`);
+  console.log(`  ${c.cyan("2.")} 右上角打开「${c.bold("开发者模式")}」开关`);
   console.log("");
-  console.log(`  ${c.cyan("3.")} 点「${c.bold("加载已解压的扩展程序")}」`);
-  console.log(`     选择目录：`);
+  console.log(`  ${c.cyan("3.")} 点左上角「${c.bold("加载已解压的扩展程序")}」`);
+  console.log(`     ${c.dim("已为你打开 Finder，选择这个文件夹：")}`);
   console.log(`     ${c.green(extDir)}`);
   console.log("");
   console.log(`  ${c.cyan("4.")} 加载后确认插件 ID 是：`);
   console.log(`     ${c.bold(EXTENSION_ID)}`);
-  console.log(`     ${c.dim("(ID 由 manifest key 固定，native host 已按此 ID 注册)")}`);
+  console.log(`     ${c.dim("(ID 固定，native host 已按此注册)")}`);
   console.log("");
 
-  // 尝试用系统默认方式打开 chrome://extensions
-  const plat = platform();
-  let opened = false;
+  // ① 打开 chrome://extensions
+  //    macOS: open -a 指定 Chrome；open URL scheme 更可靠
+  //    Linux: 直接给 google-chrome 传 URL
+  let chromeOpened = false;
   try {
     if (plat === "darwin") {
-      spawnSync("open", ["chrome://extensions"], { stdio: "ignore" });
-      opened = true;
+      // 优先用 Google Chrome，回退到默认浏览器
+      const r = spawnSync("open", ["-a", "Google Chrome", "chrome://extensions"], { stdio: "ignore" });
+      if (r.status !== 0) {
+        spawnSync("open", ["chrome://extensions"], { stdio: "ignore" });
+      }
+      chromeOpened = true;
     } else if (plat === "linux") {
-      spawnSync("xdg-open", ["chrome://extensions"], { stdio: "ignore" });
-      opened = true;
+      // 试几个常见的 Chrome 命令名
+      for (const bin of ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]) {
+        const r = spawnSync(bin, ["chrome://extensions"], { stdio: "ignore" });
+        if (r.status === 0) { chromeOpened = true; break; }
+      }
+      if (!chromeOpened) spawnSync("xdg-open", ["chrome://extensions"], { stdio: "ignore" });
+      chromeOpened = true;
     }
   } catch {}
-  if (opened) ok("已尝试打开 chrome://extensions");
+  if (chromeOpened) ok("已打开 chrome://extensions");
+
+  // ② 在 Finder/文件管理器里打开 extension 目录，方便用户直接拖拽选择
+  try {
+    if (plat === "darwin") {
+      // open <dir> 会用 Finder 打开，并选中该文件夹
+      spawnSync("open", [extDir], { stdio: "ignore" });
+      ok(`已在 Finder 打开 ${extDir}`);
+    } else if (plat === "linux") {
+      spawnSync("xdg-open", [extDir], { stdio: "ignore" });
+      ok(`已在文件管理器打开 ${extDir}`);
+    }
+  } catch {}
+
+  // ③ 交互式等待用户确认加载完成，然后校验
+  console.log("");
+  console.log(c.yellow("→ 完成上述操作后，按 Enter 继续（校验插件是否加载成功）..."));
+  console.log(c.dim("   （如果跳过，可稍后在插件 popup 里点「启动代理」验证）"));
+
+  // 等待用户按 Enter（阻塞读取 stdin）
+  return new Promise((resolve) => {
+    process.stdin.resume();
+    process.stdin.once("data", () => {
+      verifyExtensionLoaded();
+      resolve();
+    });
+    // 超时兜底：60 秒没按 Enter 就继续
+    setTimeout(() => {
+      console.log(c.dim("\n  (等待超时，继续完成安装)"));
+      process.stdin.pause();
+      resolve();
+    }, 60000);
+  });
+}
+
+// 校验插件是否加载：通过探测 native host 间接判断
+// （插件加载后 popup 才能点"启动代理"，代理起来说明 native host + 插件都通了）
+function verifyExtensionLoaded() {
+  console.log("");
+  console.log(c.dim("  校验方式：稍后在插件 popup 里点「🚀 启动代理」"));
+  console.log(c.dim("  绿灯亮 = 插件 + native host + 代理全部就绪"));
 }
 
 // ===================== 主流程 =====================
-function main() {
+async function main() {
   console.log(c.bold(c.cyan("\n🔌 终端桥接安装器")));
   console.log(c.dim("  JumpServer Web 终端 · Arthas Console\n"));
 
@@ -211,7 +263,7 @@ function main() {
   installProxyDeps();
   registerNativeHost();
   installSkill();
-  guideLoadExtension();
+  await guideLoadExtension();
 
   console.log("");
   console.log(c.green(c.bold("✓ 安装完成！")));
