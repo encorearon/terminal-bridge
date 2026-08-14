@@ -88,14 +88,41 @@ function installProxyDeps() {
   }
 
   const proxyDir = join(INSTALL_DIR, "proxy");
+
+  // 支持 --registry 透传（国内网络/公司内网常用）
+  // 用法：npx terminal-bridge-setup --registry=https://registry.npmmirror.com
+  const registryArg = process.argv.find(a => a.startsWith("--registry="));
+  const npmArgs = ["install", "--no-audit", "--no-fund"];
+  if (registryArg) {
+    npmArgs.push(registryArg);
+    console.log(c.dim(`  使用 registry: ${registryArg.split("=")[1]}`));
+  } else {
+    npmArgs.push("--silent");
+  }
+
   console.log(c.dim("  运行 npm install ..."));
-  const result = spawnSync("npm", ["install", "--silent", "--no-audit", "--no-fund"], {
+  const result = spawnSync("npm", npmArgs, {
     cwd: proxyDir,
     stdio: "inherit",
   });
 
   if (result.status !== 0) {
-    fail("npm install 失败，请检查网络后重试");
+    // 失败时给出明确的排查建议
+    console.error("");
+    console.error(c.red("  ✗ npm install 失败"));
+    console.error(c.yellow("  常见原因和解决方法："));
+    console.error("");
+    console.error("  1. 网络不通/防火墙拦截：");
+    console.error("     检查：curl -I https://registry.npmjs.org/ws");
+    console.error("");
+    console.error("  2. 公司内网/国内网络慢：换国内镜像重试");
+    console.error("     命令：npx terminal-bridge-setup --registry=https://registry.npmmirror.com");
+    console.error("");
+    console.error("  3. 需要代理：");
+    console.error("     命令：npm config set proxy http://your-proxy:port");
+    console.error("     然后重跑 npx terminal-bridge-setup");
+    console.error("");
+    fail("npm install 失败（见上方排查建议）");
   }
   ok("依赖安装完成");
 }
