@@ -30,9 +30,18 @@ function run(cmd, timeoutMs = 10000) {
     const reqId = randomBytes(4).toString("hex");
     let settled = false;
 
+    // 兜底超时定时器。关键：finish 时必须 clearTimeout——
+    // 否则即使结果 100ms 就到了，这个挂着的定时器会让 node 进程
+    // 一直活到定时器触发才退出，每次调用墙钟时间恒等于 timeoutMs+5000。
+    const fallbackTimer = setTimeout(
+      () => finish({ ok: false, error: "client timeout" }),
+      timeoutMs + 5000
+    );
+
     const finish = (result) => {
       if (settled) return;
       settled = true;
+      clearTimeout(fallbackTimer);
       try { ws.close(); } catch {}
       resolve(result);
     };
@@ -57,7 +66,6 @@ function run(cmd, timeoutMs = 10000) {
     });
 
     ws.on("error", (err) => finish({ ok: false, error: "ws error: " + err.message }));
-    setTimeout(() => finish({ ok: false, error: "client timeout" }), timeoutMs + 5000);
   });
 }
 

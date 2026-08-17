@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "mimosa-hook-status/v1",
+  "recordedAt": "2026-08-17T12:06:22.245Z",
+  "sessionId": "sess_45f64fcb-757e-4f43-83d1-86fc2da2c10d",
+  "event": "PostToolUse",
+  "toolName": "Edit",
+  "file": "/Users/admin/Code/testwork/ws-sniffer/setup-pkg/package.json",
+  "outcome": "inconclusive",
+  "coverage": "partial",
+  "findingCount": 0,
+  "durationMs": 4,
+  "hostState": "hook_complete",
+  "reportHint": ".mimosa/reports/"
+}

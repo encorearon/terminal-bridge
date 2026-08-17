@@ -1,0 +1,5 @@
+#!/bin/bash
+# Native messaging host 启动 wrapper
+# 由安装脚本（install.sh / npx 包）生成，/opt/homebrew/bin/node 和 /Users/admin/Code/testwork/ws-sniffer/native/host.js 会被替换成实际路径
+# 用绝对路径调 node，避免 Chrome 启动时 PATH 不全找不到 node
+exec /opt/homebrew/bin/node /Users/admin/Code/testwork/ws-sniffer/native/host.js
