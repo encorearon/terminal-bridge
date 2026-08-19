@@ -143,6 +143,7 @@ function maybeRunNext() {
     resolve: (result) => {
       if (pending.has(job.reqId)) {
         clearTimeout(entry.timer);
+        if (entry.weakTimer != null) { clearTimeout(entry.weakTimer); entry.weakTimer = null; }
         pending.delete(job.reqId);
         try {
           job.ws.send(JSON.stringify({ type: "result", reqId: job.reqId, ...result }));
@@ -203,7 +204,7 @@ let terminalType = "unknown";  // "unknown" | "jumpserver" | "arthas"
 
 // 各类型的 prompt 正则
 const PROMPT_RE_BY_TYPE = {
-  // JumpServer shell prompt：[user@host /dir]# 或 ]$
+  // JumpServer shell prompt（强匹配）：[user@host /dir]# 或 ]$
   // 注意：不匹配裸 >，避免输出内容里的 > 行误触发
   jumpserver: /\]\s*[#$]\s*$/,
   // Arthas prompt：arthas@pid>（带 arthas@ 前缀，不匹配裸 >）
@@ -212,16 +213,38 @@ const PROMPT_RE_BY_TYPE = {
   unknown: /\]\s*[#$]\s*$|>\s*$/,
 };
 
+// 弱 prompt（无方括号的 bash 默认 PS1）：user@host:~/path$ 或 root@host:~#
+// Ubuntu/Debian 系资产的 PS1 没有方括号，强正则永远不匹配 → 全部超时。
+// 弱匹配特征：行尾是 $ 或 #，且行内含 user@host: 或 ~/ 特征。
+// 防误判（输出行恰好以 #/$ 结尾）：不立即判定，等 WEAK_QUIET_MS 无新数据才确认。
+const WEAK_PROMPT_LINE_RE = /[$#]$/;
+const WEAK_PROMPT_CONTEXT_RE = /@[\w.-]+:|~\//;
+const WEAK_QUIET_MS = 350;
+
 // 旧名保留（cleanOutput 等处仍引用），指向宽松兜底，仅用于"删 prompt 行"的清理逻辑
 const PROMPT_RE = PROMPT_RE_BY_TYPE.unknown;
+
+// ANSI 清理（CSI + OSC），prompt 匹配统一在清理后的文本上做
+function stripAnsi(s) {
+  return s
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, "");
+}
+
+// 取 ANSI 清理后文本的最后一个非空行（去尾部空白），prompt 判定用
+function lastNonEmptyLine(s) {
+  const lines = stripAnsi(s).split("\n").map(l => l.replace(/\s+$/, ""));
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].length > 0) return lines[i];
+  }
+  return "";
+}
 
 // 探测终端类型：扫描 ANSI 清理后的文本，按 prompt 特征判定
 // 支持切换：如果已锁定类型 A，但检测到明确的类型 B 特征，则切换到 B
 // （用户在 popup 切 tab 从 Arthas 切到 JumpServer 时，代理靠这条路径纠正）
 function detectTerminalType(text) {
-  const clean = text
-    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
-    .replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, "");
+  const clean = stripAnsi(text);
 
   // Arthas prompt 特征：arthas@<pid>> （出现在任意行尾）
   if (/arthas@\S+>\s*$/m.test(clean)) {
@@ -232,11 +255,21 @@ function detectTerminalType(text) {
     return;
   }
 
-  // JumpServer shell prompt 特征：[user@host /dir]# 或 ]$
+  // JumpServer shell prompt 特征（红帽系）：[user@host /dir]# 或 ]$
   if (/\[[^\]\n]+@[^\]\n]+\][^\n]*[#$]\s*$/m.test(clean)) {
     if (terminalType !== "jumpserver") {
       terminalType = "jumpserver";
       console.log(TAG, "[probe] 终端类型切换 → jumpserver（检测到 [user@host]# prompt）");
+    }
+    return;
+  }
+
+  // JumpServer shell prompt 特征（Ubuntu/Debian 默认 PS1，无方括号）：
+  //   user@host:~/path$  或  root@host:~#
+  if (/[\w.-]+@[\w.-]+:\S*[$#]\s*$/m.test(clean)) {
+    if (terminalType !== "jumpserver") {
+      terminalType = "jumpserver";
+      console.log(TAG, "[probe] 终端类型切换 → jumpserver（检测到 user@host:path$ prompt，无方括号）");
     }
     return;
   }
@@ -350,6 +383,37 @@ function handleWsRecv(payload) {
           elapsedMs: Date.now() - entry.sentAt
         });
       }
+    } else if (entry.phase === 0 && (terminalType === "jumpserver" || terminalType === "unknown")) {
+      // ====== 弱 prompt 兜底（Ubuntu/Debian 默认 PS1 无方括号）======
+      // 强正则要求 ] 前缀；user@host:~/path$ 这种 prompt 永远匹配不上 → 全部超时。
+      // 弱匹配：最后一个非空行以 $/# 结尾且行内含 @ 或 : 特征。
+      // 防误判：不立即判定，等 WEAK_QUIET_MS 无新数据再确认
+      // （输出行恰好以 #/$ 结尾时，后续输出到达会取消定时器）。
+      const lastLine = lastNonEmptyLine(entry.buffer);
+      const weakHit = WEAK_PROMPT_LINE_RE.test(lastLine) && WEAK_PROMPT_CONTEXT_RE.test(lastLine);
+      if (weakHit) {
+        if (entry.weakTimer == null) {
+          const snapLen = entry.buffer.length;
+          entry.weakTimer = setTimeout(() => {
+            entry.weakTimer = null;
+            if (!pending.has(reqId) || entry.buffer.length !== snapLen) return;
+            const lineNow = lastNonEmptyLine(entry.buffer);
+            if (WEAK_PROMPT_LINE_RE.test(lineNow) && WEAK_PROMPT_CONTEXT_RE.test(lineNow)) {
+              console.log(TAG, `[${reqId}] 弱 prompt 确认完成（${WEAK_QUIET_MS}ms 静默）: ${lineNow.slice(-60)}`);
+              entry.lastScanLen = entry.buffer.length;
+              entry.resolve({
+                ok: true,
+                output: cleanOutput(entry.buffer, entry.cmd),
+                elapsedMs: Date.now() - entry.sentAt
+              });
+            }
+          }, WEAK_QUIET_MS);
+        }
+      } else if (entry.weakTimer != null) {
+        // 新数据不再是弱 prompt 形态，取消待确认的判定
+        clearTimeout(entry.weakTimer);
+        entry.weakTimer = null;
+      }
     }
   }
 }
@@ -398,11 +462,14 @@ function cleanOutput(text, cmd) {
     .replace(/\r\n?/g, "\n");
 
   // 删除 prompt 行：
-  //   - shell 风格：行里出现 [user@host /cwd]# 或 ]$ → 整行删
+  //   - shell 风格（红帽系）：行里出现 [user@host /cwd]# 或 ]$ → 整行删
   //     （删 "[root@host ~]# echo hello" 这种命令回显行，含粘在前面的碎片）
+  //   - shell 风格（Ubuntu/Debian，无方括号）：user@host:~/path$ 结尾的行
   //   - Arthas 风格：行尾是 arthas@xxx> 或单独的 > → 整行删
   out = out.split("\n").filter(line => {
     if (/\[[^\]\n]+@[^\]\n]+\][^\n]*[#$]/.test(line)) return false;
+    // Ubuntu prompt 行（含粘在命令回显前的情况）
+    if (/[\w.-]+@[\w.-]+:\S*[$#]\s*$/.test(line)) return false;
     // Arthas / 通用 REPL prompt：行尾 > （允许前面有 arthas@xxx 等前缀）
     if (/>\s*$/.test(line) && line.trim().length <= 60) return false;
     return true;

@@ -215,10 +215,10 @@ const PROMPT_RE_BY_TYPE = {
 
 // 弱 prompt（无方括号的 bash 默认 PS1）：user@host:~/path$ 或 root@host:~#
 // Ubuntu/Debian 系资产的 PS1 没有方括号，强正则永远不匹配 → 全部超时。
-// 弱匹配特征：行尾是 $ 或 #，且行内含 user@host: 或 ~/ 特征。
+// 弱匹配特征：行尾是 $ 或 #，且行内含 @ 或 : 路径特征。
 // 防误判（输出行恰好以 #/$ 结尾）：不立即判定，等 WEAK_QUIET_MS 无新数据才确认。
 const WEAK_PROMPT_LINE_RE = /[$#]$/;
-const WEAK_PROMPT_CONTEXT_RE = /@[\w.-]+:|~\//;
+const WEAK_PROMPT_CONTEXT_RE = /[@:]|~\//;
 const WEAK_QUIET_MS = 350;
 
 // 旧名保留（cleanOutput 等处仍引用），指向宽松兜底，仅用于"删 prompt 行"的清理逻辑

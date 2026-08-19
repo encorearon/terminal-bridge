@@ -129,8 +129,11 @@ const PROMPT_RE = /\]\s*[#$]\s*$|>\s*$/;
 
 | 终端 | prompt 样式 | 匹配部分 |
 |------|------------|---------|
-| JumpServer (shell) | `[root@host /path]#` 或 `]$` | `]\s*[#$]\s*$` |
-| Arthas | `arthas@pid>` 或 `[arthas@...]` | `>\s*$` |
+| JumpServer (shell, 红帽系) | `[root@host /path]#` 或 `]$` | 强匹配 `]\s*[#$]\s*$`（命中即完成） |
+| JumpServer (shell, Ubuntu/Debian) | `user@host:~/path$`（无方括号） | 弱匹配兜底：行尾 `$`/`#` + `user@host:`/`~/` 特征，需 350ms 静默确认 |
+| Arthas | `arthas@pid>` 或 `[arthas@...]` | `arthas@\S+>\s*$` |
+
+说明：Ubuntu/Debian 默认 PS1 没有方括号，强正则永远不命中会导致所有命令超时（曾出现在 Windows 同事的 Ubuntu 资产上）。弱兜底以 350ms 无新数据为确认条件，避免输出行恰好以 `#`/`$` 结尾时误判提前完成。
 
 注意：单独的 `>` 较宽（命令输出里 `>` 偶尔出现），但配合"行尾 + ANSI 清理后 + 注入命令后才出现"三个条件，误判率可接受。
 

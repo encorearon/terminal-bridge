@@ -78,8 +78,8 @@ Arthas 的能力不止于读，以下命令/用法一律禁止通过桥接执行
 | 页面形态 | koko connect **iframe**（嵌在 luna 父页里） | **顶层文档**（无 iframe） |
 | WebSocket URL | `wss://.../koko/ws/...` | `wss://.../ws?method=connectArthas...` |
 | WS 帧格式 | **二进制帧 opcode=2**，payload 是 base64，解码后是 SSH PTY 明文 | **文本帧 opcode=1**，payload 直接是明文 ANSI |
-| prompt 样式 | shell 风格 `[root@host /dir]#` | Arthas 风格 `arthas@pid>` 或 `[arthas@...]` |
-| prompt 锚点正则 | `/\]\s*[#$]\s*$/` | `/>/（行尾）` |
+| prompt 样式 | 红帽系 `[root@host /dir]#`；Ubuntu 资产 `user@host:~/path$`（无方括号） | Arthas 风格 `arthas@pid>` 或 `[arthas@...]` |
+| prompt 锚点 | 强匹配 `]\s*[#$]\s*$`；无方括号 prompt 走弱兜底（行尾 `$`/`#` + `user@host:` 特征，350ms 静默确认） | `arthas@\S+>\s*$` |
 | sudo 检测 | 需要（cat/df 等可能被 alias 成 sudo） | 不适用（Java 诊断工具无 sudo 概念） |
 
 **桥接层已自动处理这些差异**：content script 按是否有 `.xterm` 元素识别终端 frame（不依赖 URL），proxy 按 opcode 自动决定是否 base64 解码，prompt 锚点同时匹配两种风格。Agent 侧调用方式完全一致——都是发 `run` 帧、收 `result` 帧。
