@@ -131,16 +131,19 @@ function installProxyDeps() {
 function registerNativeHost() {
   step(3, STEPS, "注册 Native Messaging Host");
 
-  // macOS / Linux 路径不同
   const plat = platform();
+  if (plat === "win32") {
+    return registerNativeHostWindows();
+  }
+
+  // macOS / Linux 路径不同
   let destDir;
   if (plat === "darwin") {
     destDir = join(homedir(), "Library", "Application Support", "Google", "Chrome", "NativeMessagingHosts");
   } else if (plat === "linux") {
     destDir = join(homedir(), ".config", "google-chrome", "NativeMessagingHosts");
   } else {
-    console.log(c.yellow("  ⚠ Windows 平台需要手动配置 native host，跳过自动注册"));
-    console.log(c.dim("  参考：https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging"));
+    console.log(c.yellow(`  ⚠ 不支持的平台 ${plat}，跳过 native host 注册`));
     return false;
   }
 
@@ -162,6 +165,55 @@ function registerNativeHost() {
     fail(`注册校验失败：${destManifest} 不存在`);
   }
   ok(`已注册到 ${destDir}`);
+  return true;
+}
+
+// Windows 注册：生成 host.bat + manifest，写注册表 HKCU
+// Chrome 在 Windows 上通过注册表找 native host：
+//   HKCU\Software\Google\Chrome\NativeMessagingHosts\com.wssniffer.host
+//   默认值 = manifest json 的绝对路径
+function registerNativeHostWindows() {
+  console.log(c.dim("  Windows 平台：写注册表方式注册"));
+
+  const nativeDir = join(INSTALL_DIR, "native");
+
+  // 1. 生成 host.bat（等价于 macOS 的 host.sh，用绝对路径调 node）
+  //    where node 拿 node 绝对路径
+  const whereRes = spawnSync("where", ["node"], { encoding: "utf8", shell: true });
+  const nodeBin = whereRes.status === 0 ? whereRes.stdout.trim().split(/\r?\n/)[0] : "node";
+  const hostBat = join(nativeDir, "host.bat");
+  // bat 里路径可能含空格（C:\Program Files\nodejs\node.exe），必须加引号
+  writeFileSync(hostBat, `@echo off\r\n"${nodeBin}" "${join(nativeDir, "host.js")}"\r\n`);
+  ok(`生成 host.bat → ${hostBat}`);
+
+  // 2. 生成 manifest json（allowed_origins 同 macOS/Linux）
+  const manifest = {
+    name: "com.wssniffer.host",
+    description: "Terminal bridge native messaging host",
+    path: hostBat,
+    type: "stdio",
+    allowed_origins: [`chrome-extension://${EXTENSION_ID}/`],
+  };
+  const manifestPath = join(nativeDir, "com.wssniffer.host.json");
+  writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+  ok(`生成 manifest → ${manifestPath}`);
+
+  // 3. 写注册表 HKCU（用户级，不需要管理员权限）
+  const regKey = "HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\com.wssniffer.host";
+  const regRes = spawnSync("reg", ["add", regKey, "/ve", "/t", "REG_SZ", "/d", manifestPath, "/f"],
+    { stdio: "pipe", encoding: "utf8", shell: true });
+  if (regRes.status !== 0) {
+    fail(`注册表写入失败：${regRes.stderr || regRes.stdout}`);
+  }
+  ok(`已写注册表 ${regKey}`);
+  console.log(c.dim(`  → ${manifestPath}`));
+
+  // 4. 校验注册表
+  const verifyRes = spawnSync("reg", ["query", regKey, "/ve"], { encoding: "utf8", shell: true });
+  if (verifyRes.status !== 0 || !verifyRes.stdout.includes(manifestPath)) {
+    fail("注册表校验失败");
+  }
+  ok("注册表校验通过");
   return true;
 }
 
@@ -211,6 +263,7 @@ function guideLoadExtension() {
 
   // ① 打开 chrome://extensions
   //    macOS: open -a 指定 Chrome；open URL scheme 更可靠
+  //    Windows: start 命令走默认关联程序（chrome:// 会由默认浏览器处理）
   //    Linux: 直接给 google-chrome 传 URL
   let chromeOpened = false;
   try {
@@ -220,6 +273,9 @@ function guideLoadExtension() {
       if (r.status !== 0) {
         spawnSync("open", ["chrome://extensions"], { stdio: "ignore" });
       }
+      chromeOpened = true;
+    } else if (plat === "win32") {
+      spawnSync("cmd", ["/c", "start", "", "chrome://extensions"], { stdio: "ignore", shell: true });
       chromeOpened = true;
     } else if (plat === "linux") {
       // 试几个常见的 Chrome 命令名
@@ -239,6 +295,9 @@ function guideLoadExtension() {
       // open <dir> 会用 Finder 打开，并选中该文件夹
       spawnSync("open", [extDir], { stdio: "ignore" });
       ok(`已在 Finder 打开 ${extDir}`);
+    } else if (plat === "win32") {
+      spawnSync("explorer", [extDir], { stdio: "ignore" });
+      ok(`已在资源管理器打开 ${extDir}`);
     } else if (plat === "linux") {
       spawnSync("xdg-open", [extDir], { stdio: "ignore" });
       ok(`已在文件管理器打开 ${extDir}`);
@@ -301,7 +360,10 @@ async function main() {
   console.log(`  ${c.cyan("•")} 两个绿灯亮，即可通过 Agent 发命令`);
   console.log("");
   console.log(c.dim(`文件位置：${INSTALL_DIR}`));
-  console.log(c.dim(`卸载：rm -rf ${INSTALL_DIR} && rm ~/Library/Application\\ Support/Google/Chrome/NativeMessagingHosts/com.wssniffer.host.json`));
+  const uninstallHint = platform() === "win32"
+    ? `卸载：rd /s /q ${INSTALL_DIR} && reg delete HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\com.wssniffer.host /f`
+    : `卸载：rm -rf ${INSTALL_DIR} && rm ~/Library/Application\\ Support/Google/Chrome/NativeMessagingHosts/com.wssniffer.host.json`;
+  console.log(c.dim(uninstallHint));
   console.log("");
 }
 

@@ -13,11 +13,6 @@
 
 import { WebSocketServer } from "ws";
 import { randomBytes } from "node:crypto";
-import { writeFileSync, unlinkSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-
-// PID 文件：native host「停止代理」时读取。代理自己在 listening 后写入。
-const PID_FILE = fileURLToPath(new URL("./.proxy.pid", import.meta.url));
 import {
   auditArthasCommand,
   isArthasCommand,
@@ -520,19 +515,10 @@ wss.on("listening", () => {
   const { address, port } = wss.address();
   console.log(TAG, `监听 ws://${address}:${port}/ssh`);
   console.log(TAG, "等待插件连接（role: extension）和 Agent 连接（发 run 请求）");
-
-  // 写 PID 文件：native host 的「停止代理」靠它找到本进程。
-  // 由代理自己写（而不是 host 代写）保证准确性——手动 node server.js
-  // 启动时也有 PID 文件可停。进程自己写自己的 process.pid，无注入面。
-  try {
-    writeFileSync(PID_FILE, String(process.pid));
-    console.log(TAG, `PID ${process.pid} → ${PID_FILE}`);
-  } catch {}
 });
 
 function shutdown() {
   console.error(TAG, "shutting down");
-  try { unlinkSync(PID_FILE); } catch {}
   wss.clients.forEach((c) => c.close(1001, "shutting down"));
   for (const [, entry] of pending) {
     clearTimeout(entry.timer);
