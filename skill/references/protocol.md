@@ -63,9 +63,12 @@
 }
 ```
 - `output`：prompt 锚点出现前的所有 recv 帧拼接，已去 ANSI、`\r\n`→`\n`、
-  控制字符（NUL 等）替换为空格、删 prompt 行和命令回显行（折行感知）、首尾 trim。
-  **空输出兜底**：若清理后为空但原始帧有内容（≥512 字符），返回截断的原始内容
-  并附 `[warning] output filtered to empty...` 提示——绝不返回 ok:true + 空输出。
+  控制字符（NUL 等）替换为空格、删 prompt 行和命令回显行（折行感知）、
+  剥离行尾 prompt 后缀（无尾换行输出与 prompt 合并形态）、首尾 trim。
+  prompt 段识别带长度约束（user/host 各 ≤64 字符），防止截断 JSON 的 `[`
+  被当作 prompt 起点跨吞整行（Case A 根因）。
+  **双层兜底**：清理后为空或清理损失率 >80%（原始 ≥512 字符）时，附加
+  `[warning]` + 截断原始内容——绝不静默丢弃大段输出。
 - `unterminated-quote`：命令含未闭合引号，远端 shell 卡在 PS2 续行（`>` 提示）。
   代理检测到后 ~400ms 快速失败并自动 Ctrl+C 退出续行（终端可继续用），
   `suggest` 会指向 base64 通道。

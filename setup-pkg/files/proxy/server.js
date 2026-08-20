@@ -537,17 +537,30 @@ function cleanOutput(text, cmd) {
     .replace(/\r\n?/g, "\n");
 
   // 删除 prompt 行（命令回显行 = prompt + 命令文本，可能粘有 kitty 重绘碎片）：
-  //   - 红帽系：[user@host /cwd]# —— 要求 ] 后紧跟 #$（不再允许中间隔任意内容）
-  //   - Ubuntu/Debian：user@host:~/path$ —— 要求出现在行首附近（≤40 字符前缀内，
-  //     覆盖 kitty 碎片），且 prompt 段内无空格
+  //   - 红帽系：[user@host /cwd]# —— user/host 段各限长 64（真实 prompt 远短于此）。
+  //     不限长时的实测反例（Case A）：head -c 600 截断的 JSON 无闭合 ]，
+  //     "data":[ 的 [ 落在前缀窗口内，[^\]]+ 跨过整段 JSON 匹配到 prompt 的 @…]
+  //     → 647 字符合并行整行被误删。长度约束让这种跨吞匹配失败。
+  //   - Ubuntu/Debian：user@host:~/path$ —— 同样限长
   //   - Arthas：行尾 > 且行短（≤60 字符）
   // 前缀窗口 40 字符：正常 prompt 行 prompt 就在行首；碎片通常几到几十字符。
   out = out.split("\n").filter(line => {
-    if (/^.{0,40}\[[^\]\n]+@[^\]\n]+\]\s*[#$]/.test(line)) return false;
-    if (/^.{0,40}[\w.-]+@[\w.-]+:[^\s]*[$#]/.test(line)) return false;
+    if (/^.{0,40}\[[^\]\n]{1,64}@[^\]\n]{1,64}\]\s*[#$]/.test(line)) return false;
+    if (/^.{0,40}[\w.-]{1,64}@[\w.-]{1,64}:[^\s]{0,128}[$#]/.test(line)) return false;
     // Arthas / 通用 REPL prompt：行尾 > （允许前面有 arthas@xxx 等前缀）
     if (/>\s*$/.test(line) && line.trim().length <= 60) return false;
     return true;
+  }).join("\n");
+
+  // 行尾 prompt 后缀剥离：无尾换行的输出（head -c N 截断）会与后续 prompt
+  // 合并成同一物理行。上面的整行过滤（带前缀窗口）会放过这种合并行——内容
+  // 保住了，但 prompt 碎片粘在输出尾巴上（如 JSON 尾 + [root@host dir]#），
+  // 污染 Agent 的后续解析。这里只剥离行尾的 prompt 形态后缀，内容原样保留。
+  out = out.split("\n").map(line => {
+    if (line.length <= 100) return line;  // 短行已由整行过滤处理，避免误伤
+    return line
+      .replace(/\[[^\]\n]{1,64}@[^\]\n]{1,64}\]\s*[#$]\s*$/, "")   // 红帽系后缀
+      .replace(/[\w.-]{1,64}@[\w.-]{1,64}:[^\s]{0,128}[$#]\s*$/, ""); // Ubuntu 后缀
   }).join("\n");
 
   // 删除 koko 控制消息：koko 偶尔在终端流里发送 JSON 控制消息
@@ -593,26 +606,35 @@ function cleanOutput(text, cmd) {
 }
 
 // ===================== 输出兜底（问题 1 的安全网）=====================
-// 清理后为空、但原始 WS 帧里有实际内容时，绝不能返回 ok:true + 空输出——
-// 那会让 Agent 误判"命令无输出/文件为空"。这里返回去 ANSI 的原始内容
-// （截断到 4KB）+ raw 字节数提示，把"被过滤"的事实显式暴露给调用方。
+// 两层防御：
+//   1. 清理后为空 + 原始内容 ≥512 字符 → 返回截断原始内容 + warning
+//   2. 清理损失率 >80%（原始 ≥512 字符但清理后 <20%）→ 保留清理结果，
+//      但附加 warning + 原始内容截断——任何未来的 filter 误杀都不再静默
+// （Case A 教训：REDHAT 正则曾跨吞 647 字节合并行，靠这层兜底可暴露）
 const RAW_FALLBACK_THRESHOLD = 512;   // 原始内容低于此值视为真无输出
 const RAW_FALLBACK_LIMIT = 4000;      // 兜底输出截断长度
 
 function finalizeOutput(entry) {
-  const cleaned = cleanOutput(entry.buffer, entry.echoCmd != null ? entry.echoCmd : entry.cmd);
-  if (cleaned.length > 0) return cleaned;
+  const echoCmd = entry.echoCmd != null ? entry.echoCmd : entry.cmd;
+  const cleaned = cleanOutput(entry.buffer, echoCmd);
 
   const raw = stripAnsi(entry.buffer)
     .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, " ")
     .replace(/\r\n?/g, "\n")
     .trim();
-  if (raw.length < RAW_FALLBACK_THRESHOLD) return "";
+  if (raw.length < RAW_FALLBACK_THRESHOLD) return cleaned;
 
-  const note = `[warning] output filtered to empty by cleaner; raw ${raw.length} chars shown (truncated)]`;
-  return raw.length > RAW_FALLBACK_LIMIT
-    ? raw.slice(0, RAW_FALLBACK_LIMIT) + "\n" + note
-    : raw + "\n" + note;
+  const truncated = raw.length > RAW_FALLBACK_LIMIT
+    ? raw.slice(0, RAW_FALLBACK_LIMIT) + "\n...[truncated]"
+    : raw;
+
+  if (cleaned.length === 0) {
+    return truncated + `\n[warning] output filtered to empty by cleaner; raw ${raw.length} chars shown]`;
+  }
+  if (cleaned.length < raw.length * 0.2) {
+    return cleaned + `\n[warning] cleaner dropped ${(100 - Math.round(cleaned.length / raw.length * 100))}% of output; raw tail:\n${truncated}`;
+  }
+  return cleaned;
 }
 
 // ===================== WebSocket 服务 =====================
