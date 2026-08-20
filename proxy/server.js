@@ -70,10 +70,41 @@ function genReqId() {
 }
 
 // Agent 发来的 run 请求
+// 支持两种命令下发方式：
+//   { cmd: "..." }          —— 明文命令（原有）
+//   { cmdB64: "<base64>" }  —— base64 编码命令（多层引号场景的安全传参通道）
+//       代理解码后包装成 `echo <b64> | base64 -d | sh` 下发：
+//       base64 字符集（A-Za-z0-9+/=）不含引号/空格/元字符，四层引号嵌套
+//       （Bash→mjs→SSH→kubectl exec→sh -c）下也不会被任何一层剥离篡改。
 function handleRun(ws, msg) {
   const reqId = msg.reqId || genReqId();
-  const cmd = (msg.cmd || "").toString();
   const timeoutMs = Number(msg.timeoutMs || DEFAULT_TIMEOUT_MS);
+
+  let cmd;
+  let wrapped = null;  // 实际注入终端的完整文本（base64 通道时为 wrapper 命令）
+
+  if (msg.cmdB64) {
+    // base64 通道：解码 → 校验 → 包装
+    let decoded;
+    try {
+      decoded = Buffer.from(String(msg.cmdB64), "base64").toString("utf8");
+    } catch {
+      ws.send(JSON.stringify({ type: "result", reqId, ok: false, error: "invalid cmdB64" }));
+      return;
+    }
+    if (!decoded.trim()) {
+      ws.send(JSON.stringify({ type: "result", reqId, ok: false, error: "empty cmd" }));
+      return;
+    }
+    if (decoded.length > 16 * 1024) {
+      ws.send(JSON.stringify({ type: "result", reqId, ok: false, error: "cmd too long (max 16KB after decode)" }));
+      return;
+    }
+    cmd = decoded;
+    wrapped = `echo ${Buffer.from(cmd, "utf8").toString("base64")} | base64 -d | sh`;
+  } else {
+    cmd = (msg.cmd || "").toString();
+  }
 
   if (!cmd) {
     ws.send(JSON.stringify({ type: "result", reqId, ok: false, error: "empty cmd" }));
@@ -109,7 +140,7 @@ function handleRun(ws, msg) {
     }
   }
 
-  const job = { ws, reqId, cmd: finalCmd, timeoutMs, sentAt: Date.now() };
+  const job = { ws, reqId, cmd: finalCmd, wrapped, timeoutMs, sentAt: Date.now() };
   queue.push(job);
   maybeRunNext();
 }
@@ -129,12 +160,14 @@ function maybeRunNext() {
   // 关键：prompt 是服务端 shell 在命令完成后输出的，不受 kitty 输入重绘影响。
   //
   // 流程：
-  //   1. 发 cmd + \r
+  //   1. 发 cmd + \r（base64 通道时发 `echo <b64> | base64 -d | sh` + \r）
   //   2. 在 ws-recv 流里累积，找 prompt 正则匹配（]\s*[#$]\s*$ 在行尾）
   //   3. 第一次匹配到 prompt：说明之前的 buffer 含"上一条命令的尾部 prompt + cmd 回显"，
   //      从这个 prompt 之后开始才是本命令的输出区域
   //   4. 第二次匹配到 prompt：命令执行完毕，两个 prompt 之间就是输出
-  const wrapped = `${job.cmd}\r`;
+  // 注：wrapped 优先用 handleRun 传入的 base64 wrapper（此时终端回显的是 wrapper
+  // 命令而非原始 cmd，回显清理必须按 wrapper 比对才能删掉）。
+  const wrapped = `${job.wrapped != null ? job.wrapped : job.cmd}\r`;
 
   // 状态机：
   //   phase 0 (wait_prompt_1) : 等 prompt 第 1 次出现（命令回显前的 prompt）
@@ -144,6 +177,7 @@ function maybeRunNext() {
       if (pending.has(job.reqId)) {
         clearTimeout(entry.timer);
         if (entry.weakTimer != null) { clearTimeout(entry.weakTimer); entry.weakTimer = null; }
+        if (entry.ps2Timer != null) { clearTimeout(entry.ps2Timer); entry.ps2Timer = null; }
         pending.delete(job.reqId);
         try {
           job.ws.send(JSON.stringify({ type: "result", reqId: job.reqId, ...result }));
@@ -156,6 +190,8 @@ function maybeRunNext() {
     phase: 0,
     buffer: "",
     cmd: job.cmd,
+    // 回显清理用的比对串：base64 通道下终端实际回显的是 wrapper 命令
+    echoCmd: job.wrapped != null ? job.wrapped : job.cmd,
     promptCount: 0
   };
   pending.set(job.reqId, entry);
@@ -168,7 +204,7 @@ function maybeRunNext() {
     entry.resolve({
       ok: false,
       error: "timeout",
-      output: cleanOutput(entry.buffer, entry.cmd),
+      output: finalizeOutput(entry),
       elapsedMs: Date.now() - job.sentAt
     });
   }, job.timeoutMs);
@@ -362,6 +398,40 @@ function handleWsRecv(payload) {
       continue;  // 已 resolve，跳过后续 prompt 检测
     }
 
+    // ====== PS2 续行快速失败（问题 3，必须在 prompt 匹配之前）======
+    // 多层引号在某层被剥离/篡改后，远端 shell 因引号未闭合进入续行等待，
+    // 终端显示行首孤立的 >（PS2 提示符）。此时 prompt 锚点永远不会命中 →
+    // 死等超时。检测到孤立 > 且 400ms 无新数据时立即失败并 Ctrl+C 退出续行
+    // （终端回到正常 prompt，可继续执行后续命令），返回明确的错误类型。
+    // 顺序关键：unknown 类型的宽松兜底正则含裸 >，PS2 的 > 若先落到那里
+    // 会被误判成"命令完成"（实测：ok + 空输出），所以 PS2 必须先检查。
+    if (entry.phase === 0 && /^\s*>$/.test(lastNonEmptyLine(entry.buffer))) {
+      if (entry.ps2Timer == null) {
+        const ps2SnapLen = entry.buffer.length;
+        entry.ps2Timer = setTimeout(() => {
+          entry.ps2Timer = null;
+          if (!pending.has(reqId) || entry.buffer.length !== ps2SnapLen) return;
+          if (!/^\s*>$/.test(lastNonEmptyLine(entry.buffer))) return;
+          console.warn(TAG, `[${reqId}] PS2 续行命中（未闭合引号），快速失败 + Ctrl+C 退出续行`);
+          sendCtrlC();
+          entry.resolve({
+            ok: false,
+            error: "unterminated-quote",
+            message: "命令疑似包含未闭合的引号/括号，远端 shell 进入续行等待（PS2 >）。已自动 Ctrl+C 退出续行。多层引号场景请改用 base64 通道下发命令。",
+            suggest: "用 client 的 --b64 参数（或 run 帧的 cmdB64 字段）下发，规避多层引号剥离",
+            output: finalizeOutput(entry),
+            elapsedMs: Date.now() - entry.sentAt
+          });
+        }, 400);
+      }
+      // PS2 等待期间不做 prompt 匹配（下一帧数据到达会重新进入本循环）
+      continue;
+    }
+    if (entry.ps2Timer != null) {
+      clearTimeout(entry.ps2Timer);
+      entry.ps2Timer = null;
+    }
+
     // 检查清理后 buffer 的尾部是否以 prompt 结尾
     // 用按终端类型选出的正则（截断根治：jumpserver 不再被裸 > 误触发）
     const tail = cleanFull.slice(-200);
@@ -375,8 +445,8 @@ function handleWsRecv(payload) {
         // 早已流过（attach 之前）。我们注入 cmd 后，第一个出现的 prompt 就是
         // 命令完成后的 prompt。所以只需等 1 个 prompt。
         // buffer 里 = kitty 重绘碎片 + cmd 回显 + 真实输出 + 最终 prompt
-        // 切掉末尾 prompt，前面的内容交给 cleanOutput 清理（删 prompt 行、碎片）
-        const output = cleanOutput(entry.buffer, entry.cmd);
+        // 切掉末尾 prompt，前面的内容交给清理器（finalizeOutput 含空兜底）
+        const output = finalizeOutput(entry);
         entry.resolve({
           ok: true,
           output,
@@ -403,7 +473,7 @@ function handleWsRecv(payload) {
               entry.lastScanLen = entry.buffer.length;
               entry.resolve({
                 ok: true,
-                output: cleanOutput(entry.buffer, entry.cmd),
+                output: finalizeOutput(entry),
                 elapsedMs: Date.now() - entry.sentAt
               });
             }
@@ -446,11 +516,13 @@ function probeLog(data, opcode) {
 
 // ===================== 输出清理 =====================
 // prompt 锚点方案：buffer = kitty 重绘碎片 + cmd 回显 + 真实输出 + 最终 prompt
-// 清理策略：
+// 清理策略（收紧：只删确定属于终端噪音的内容，其余原样保留）：
 //   1. 去 ANSI（颜色、OSC 标题）
-//   2. 删含 prompt 模式的行（命令回显行，含粘在前面的碎片）
-// 注：kitty 重绘碎片（cmd 文本的片段）可能残留几行，但不影响 Agent 理解输出。
-// 不做 cmd 子串清理——它会误删真实输出（如 cmd="echo hello"，输出"hello"会被删）。
+//   2. 控制字符替换为空格（NUL/x00 等，/proc/*/cmdline 场景；绝不因含控制字符丢整段）
+//   3. 删 prompt 行（要求 prompt 出现在行首附近，且 #$ 紧跟 prompt——
+//      旧行为 "]/…任意内容…/#$" 会把含 ] 和 $ 的长 JSON 输出整行误删，即问题 1 根因）
+//   4. 删 koko 控制消息行
+//   5. 删命令回显行（折行感知：终端宽度折行会把长命令拆成多行，先做软换行 join 再比对）
 function cleanOutput(text, cmd) {
   if (!text) return "";
   let out = text
@@ -458,18 +530,21 @@ function cleanOutput(text, cmd) {
     .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
     // ANSI OSC 序列：ESC ] ... BEL 或 ESC \（标题设置等）
     .replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, "")
+    // 控制字符 → 空格：NUL 等 C0 控制符（保留 \t\n\r，它们在下一步处理）。
+    // /proc/*/cmdline、environ 都是 NUL 分隔，替换而非丢弃（问题 2）
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, " ")
     // \r\n 和孤立 \r → \n
     .replace(/\r\n?/g, "\n");
 
-  // 删除 prompt 行：
-  //   - shell 风格（红帽系）：行里出现 [user@host /cwd]# 或 ]$ → 整行删
-  //     （删 "[root@host ~]# echo hello" 这种命令回显行，含粘在前面的碎片）
-  //   - shell 风格（Ubuntu/Debian，无方括号）：user@host:~/path$ 结尾的行
-  //   - Arthas 风格：行尾是 arthas@xxx> 或单独的 > → 整行删
+  // 删除 prompt 行（命令回显行 = prompt + 命令文本，可能粘有 kitty 重绘碎片）：
+  //   - 红帽系：[user@host /cwd]# —— 要求 ] 后紧跟 #$（不再允许中间隔任意内容）
+  //   - Ubuntu/Debian：user@host:~/path$ —— 要求出现在行首附近（≤40 字符前缀内，
+  //     覆盖 kitty 碎片），且 prompt 段内无空格
+  //   - Arthas：行尾 > 且行短（≤60 字符）
+  // 前缀窗口 40 字符：正常 prompt 行 prompt 就在行首；碎片通常几到几十字符。
   out = out.split("\n").filter(line => {
-    if (/\[[^\]\n]+@[^\]\n]+\][^\n]*[#$]/.test(line)) return false;
-    // Ubuntu prompt 行（含粘在命令回显前的情况）
-    if (/[\w.-]+@[\w.-]+:\S*[$#]\s*$/.test(line)) return false;
+    if (/^.{0,40}\[[^\]\n]+@[^\]\n]+\]\s*[#$]/.test(line)) return false;
+    if (/^.{0,40}[\w.-]+@[\w.-]+:[^\s]*[$#]/.test(line)) return false;
     // Arthas / 通用 REPL prompt：行尾 > （允许前面有 arthas@xxx 等前缀）
     if (/>\s*$/.test(line) && line.trim().length <= 60) return false;
     return true;
@@ -483,19 +558,61 @@ function cleanOutput(text, cmd) {
     return true;
   }).join("\n");
 
-  // 删除命令回显行：整行（去空白后）等于 cmd 的行
-  // 注意是精确匹配整行，不是子串——避免误删真实输出
-  if (cmd) {
+  // 删除命令回显行：整行（去空白后）等于 cmd 的行。
+  // 折行感知（问题 4）：长命令在终端宽度处折行会拆开 token（--com\nmand=），
+  // 单行比对失败 → 残留回显碎片。这里允许把连续 1-4 行 join 后再与 cmd 比对，
+  // 匹配则整组删除。只做"合并后完全相等"的精确匹配，不做子串匹配（防误删真实输出）。
+  if (cmd && cmd.trim()) {
     const cmdNoWs = cmd.replace(/\s+/g, "");
-    out = out.split("\n").filter(line => {
-      const lineNoWs = line.replace(/\s+/g, "");
-      return lineNoWs !== cmdNoWs;
-    }).join("\n");
+    const lines = out.split("\n");
+    const kept = [];
+    let i = 0;
+    while (i < lines.length) {
+      let matched = false;
+      let joinedNoWs = "";
+      for (let k = 0; i + k < lines.length; k++) {
+        joinedNoWs += lines[i + k].replace(/\s+/g, "");
+        if (joinedNoWs.length > cmdNoWs.length) break;
+        if (joinedNoWs === cmdNoWs) {
+          i += k + 1;
+          matched = true;
+          break;
+        }
+      }
+      if (!matched) {
+        kept.push(lines[i]);
+        i++;
+      }
+    }
+    out = kept.join("\n");
   }
 
   return out
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+
+// ===================== 输出兜底（问题 1 的安全网）=====================
+// 清理后为空、但原始 WS 帧里有实际内容时，绝不能返回 ok:true + 空输出——
+// 那会让 Agent 误判"命令无输出/文件为空"。这里返回去 ANSI 的原始内容
+// （截断到 4KB）+ raw 字节数提示，把"被过滤"的事实显式暴露给调用方。
+const RAW_FALLBACK_THRESHOLD = 512;   // 原始内容低于此值视为真无输出
+const RAW_FALLBACK_LIMIT = 4000;      // 兜底输出截断长度
+
+function finalizeOutput(entry) {
+  const cleaned = cleanOutput(entry.buffer, entry.echoCmd != null ? entry.echoCmd : entry.cmd);
+  if (cleaned.length > 0) return cleaned;
+
+  const raw = stripAnsi(entry.buffer)
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, " ")
+    .replace(/\r\n?/g, "\n")
+    .trim();
+  if (raw.length < RAW_FALLBACK_THRESHOLD) return "";
+
+  const note = `[warning] output filtered to empty by cleaner; raw ${raw.length} chars shown (truncated)]`;
+  return raw.length > RAW_FALLBACK_LIMIT
+    ? raw.slice(0, RAW_FALLBACK_LIMIT) + "\n" + note
+    : raw + "\n" + note;
 }
 
 // ===================== WebSocket 服务 =====================

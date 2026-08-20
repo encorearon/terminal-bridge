@@ -120,6 +120,10 @@ node client-example.mjs "uname -a"
 node client-example.mjs "df -h" 15000              # 第二参数是超时 ms
 node client-example.mjs "ps aux | grep java" 20000
 
+# 多层引号场景（kubectl exec / 嵌套引号）：加 --b64 走 base64 通道，
+# 命令经 base64 编码下发（echo <b64> | base64 -d | sh），任何一层都不会剥离引号
+node client-example.mjs --b64 "kubectl exec -n ns pod -- sh -c 'ps aux | grep java'"
+
 # Arthas 场景
 node client-example.mjs "help"
 node client-example.mjs "thread"                    # 查看线程概况
@@ -259,6 +263,8 @@ Agent → 代理：
 | `error: arthas-forbidden` | Arthas 高风险命令（retransform/profiler/stop/reset）被禁用 | 告知用户去浏览器 Arthas 终端手动执行，不要重试或绕过 |
 | `error: arthas-needs-limit` | 中风险命令（trace/watch/stack/monitor）缺 -n/#cost（严格模式） | 按 suggest 补参数重发，或加 `-n 1` |
 | `error: arthas-quota-exceeded` | 中风险命令会话内超限（默认 20 次） | 告知用户已达上限，不要重试；如需继续重启代理 |
+| `error: unterminated-quote` | 命令含未闭合引号，远端 shell 卡在 PS2 续行（已自动 Ctrl+C 退出） | 检查引号配对；多层引号场景改用 `--b64` 通道重发 |
+| 输出末尾带 `[warning] output filtered to empty...` | 清理器把输出过滤为空，兜底返回了原始内容（截断） | 输出可用但含终端噪音；原命令输出被判定为 prompt 噪音时可调整命令（如拆行） |
 | `error: timeout` + output 含 `[sudo] password` | 旧版代理未实现 sudo 检测 | 升级 proxy/server.js；临时用绝对路径 `/bin/cat` 绕过 |
 | `error: timeout` + output 为空 | 命令是交互式/持续刷新（vim/dashboard/monitor） | 改用非交互等价命令，或 Arthas 用一次性命令（thread/jad） |
 | 命令发出去但 Arthas/JumpServer 没反应 | content script 没识别到 xterm | 让用户 F5 刷新终端页，或在 popup 点"捕捉 xterm" |

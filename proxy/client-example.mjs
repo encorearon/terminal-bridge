@@ -24,7 +24,7 @@ const BRIDGE = process.env.BRIDGE || "ws://127.0.0.1:8787/ssh";
  * @param {number} timeoutMs - 超时（默认 10s）
  * @returns {Promise<{ok: boolean, output?: string, error?: string, suggest?: string, message?: string}>}
  */
-function run(cmd, timeoutMs = 10000) {
+function run(cmd, timeoutMs = 10000, opts = {}) {
   return new Promise((resolve) => {
     const ws = new WebSocket(BRIDGE);
     const reqId = randomBytes(4).toString("hex");
@@ -47,7 +47,12 @@ function run(cmd, timeoutMs = 10000) {
     };
 
     ws.on("open", () => {
-      ws.send(JSON.stringify({ type: "run", reqId, cmd, timeoutMs }));
+      // base64 通道：命令 base64 编码后由代理包装成 `echo <b64> | base64 -d | sh`。
+      // 用于多层引号场景（Bash→mjs→SSH→kubectl exec→sh -c），彻底规避引号剥离。
+      const payload = { type: "run", reqId, timeoutMs };
+      if (opts.b64) payload.cmdB64 = Buffer.from(cmd, "utf8").toString("base64");
+      else payload.cmd = cmd;
+      ws.send(JSON.stringify(payload));
     });
 
     ws.on("message", (raw) => {
@@ -85,10 +90,11 @@ function run(cmd, timeoutMs = 10000) {
  * @param {function} ask - 可选的自定义询问函数，默认用 readline 控制台提问。
  *                         Agent 接入时应传入自己的 AskUserQuestion 逻辑。
  *                         签名: async (message) => boolean
+ * @param {object} opts - 可选，透传给 run()：{ b64: true } 走 base64 通道
  * @returns {Promise<{ok: boolean, output?: string, error?: string}>}
  */
-async function runWithSudoRetry(cmd, timeoutMs = 10000, ask = defaultAsk) {
-  let result = await run(cmd, timeoutMs);
+async function runWithSudoRetry(cmd, timeoutMs = 10000, ask = defaultAsk, opts = {}) {
+  let result = await run(cmd, timeoutMs, opts);
 
   if (result.error === "sudo-required") {
     const approved = await ask(result.message || "检测到需要 sudo 权限，是否切换到 root 后重试？");
@@ -103,7 +109,7 @@ async function runWithSudoRetry(cmd, timeoutMs = 10000, ask = defaultAsk) {
     }
     // 切成功后重发原命令
     console.log("→ 重新执行原命令");
-    result = await run(cmd, timeoutMs);
+    result = await run(cmd, timeoutMs, opts);
   }
 
   return result;
@@ -178,20 +184,26 @@ async function runWithArthasGuard(cmd, timeoutMs = 10000, ask = defaultAsk) {
 }
 
 // --- CLI ---
-const cmd = process.argv[2] || "uname -a";
-const timeoutMs = Number(process.argv[3] || 10000);
+// 用法：node client-example.mjs [--b64] "<cmd>" [timeoutMs]
+//   --b64  命令经 base64 通道下发（多层引号场景防剥离，kubectl exec 刚需）
+const cliArgs = process.argv.slice(2).filter(a => a !== "--b64");
+const useB64 = process.argv.slice(2).includes("--b64");
+const cmd = cliArgs[0] || "uname -a";
+const timeoutMs = Number(cliArgs[1] || 10000);
+const runOpts = { b64: useB64 };
 
-console.log(`→ run: ${cmd}`);
+console.log(`→ run${useB64 ? " [b64]" : ""}: ${cmd}`);
 // 自动判断用哪种 wrapper：Arthas 命令走 guard，其他走 sudo 重试
 const { isArthasCommand } = await import("./arthas-guard.js");
 const result = isArthasCommand(cmd)
   ? await runWithArthasGuard(cmd, timeoutMs)
-  : await runWithSudoRetry(cmd, timeoutMs);
+  : await runWithSudoRetry(cmd, timeoutMs, undefined, runOpts);
 if (result.ok) {
   console.log(`✓ ok (${result.elapsedMs}ms)`);
   console.log(result.output);
 } else {
   console.error(`✗ failed: ${result.error || "unknown"}`);
+  if (result.message) console.error(result.message);
   if (result.output) console.log("--- partial output ---\n" + result.output);
   process.exit(1);
 }

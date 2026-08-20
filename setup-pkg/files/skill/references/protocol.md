@@ -27,9 +27,14 @@
 }
 ```
 - `reqId`：可选。不传则代理生成（8 位 hex）。用于配对 result。
-- `cmd`：必填。命令本身，**不要自己加哨兵/换行**——代理会自动包末尾 `\r`。
+- `cmd`：必填（与 `cmdB64` 二选一）。命令本身，**不要自己加哨兵/换行**——代理会自动包末尾 `\r`。
   - JumpServer：linux 命令，如 `ps aux | grep java`
   - Arthas：Arthas 命令，如 `jad com.foo.Bar`
+- `cmdB64`：可选，与 `cmd` 二选一。命令的 base64 编码（UTF-8）。
+  代理解码后包装成 `echo <b64> | base64 -d | sh` 下发——base64 字符集不含
+  引号/空格/元字符，Bash→mjs→SSH→kubectl exec→sh -c 多层引号嵌套下也不会
+  被任何一层剥离篡改。kubectl exec / 嵌套引号场景**必须**用这个通道。
+  限制：解码后 ≤16KB。client 侧对应 `--b64` 参数。
 - `timeoutMs`：可选，默认 10000。超时则返回 `ok:false, error:timeout`。
 
 ### 代理 → Agent
@@ -50,14 +55,20 @@
   "type": "result",
   "reqId": "abc123",
   "ok": false,
-  "error": "timeout | inject failed | extension disconnected | sudo-required | arthas-forbidden | arthas-needs-limit | arthas-quota-exceeded",
+  "error": "timeout | inject failed | extension disconnected | sudo-required | arthas-forbidden | arthas-needs-limit | arthas-quota-exceeded | unterminated-quote",
   "output": "部分输出（可能为空）",
   "suggest": "更安全的替代命令（部分错误才有）",
   "message": "给用户看的说明文字（部分错误才有）",
   "elapsedMs": 10000
 }
 ```
-- `output`：prompt 锚点出现前的所有 recv 帧拼接，已去 ANSI、`\r\n`→`\n`、删 prompt 行和命令回显行、首尾 trim。
+- `output`：prompt 锚点出现前的所有 recv 帧拼接，已去 ANSI、`\r\n`→`\n`、
+  控制字符（NUL 等）替换为空格、删 prompt 行和命令回显行（折行感知）、首尾 trim。
+  **空输出兜底**：若清理后为空但原始帧有内容（≥512 字符），返回截断的原始内容
+  并附 `[warning] output filtered to empty...` 提示——绝不返回 ok:true + 空输出。
+- `unterminated-quote`：命令含未闭合引号，远端 shell 卡在 PS2 续行（`>` 提示）。
+  代理检测到后 ~400ms 快速失败并自动 Ctrl+C 退出续行（终端可继续用），
+  `suggest` 会指向 base64 通道。
 - `error` 枚举：
   - `timeout` — 命令超时（交互式/持续命令会触发）
   - `inject failed` — content script 注入失败（xterm 没捕捉到）
