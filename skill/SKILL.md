@@ -100,6 +100,8 @@ cd ~/.terminal-bridge/proxy && node server.js &
 
 多终端场景：如果同时开了 JumpServer 和 Arthas 两个 tab，代理命令只会发给 popup 里"当前选中"的那个 tab。切换用 popup 的 tab 选择器，或让用户在 popup 点选。
 
+Yearning 场景：popup 的「Yearning 监听」会列出所有已监听页面，并显示数据库名、数据源、host 和当前标记。多个 Yearning 页面同时打开时，必须先点击列表项选择「当前 Yearning 页面」，SQL 只会注入该页面，结果也按 tab 隔离，不会串页。
+
 如果用户说"命令没反应"或"inject-failed"：
 1. `chrome://extensions/` 刷新 Terminal Bridge 插件 ↻
 2. 让用户在终端页面按 F5 刷新（让 content script 重新识别 xterm）

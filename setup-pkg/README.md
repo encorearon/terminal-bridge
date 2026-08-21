@@ -46,6 +46,10 @@ Agent (命令)
 ## 特性
 
 - **双终端支持**：JumpServer 堡垒机 Web 终端 + Arthas Web Console
+- **Yearning SQL 自动化**：Agent 通过 yr-run 注入 SQL → 自动点查询 → MessagePack 结果帧解码返回；手动查询同样捕获
+- **CSV 导出**：每次查询结果自动进 popup 的「CSV 导出记录」，点击即下载（BOM + RFC4180，Excel 直开）
+- **多 Yearning 页面**：popup 列表展示数据源/数据库，选择目标页面，SQL 注入与结果按 tab 隔离
+- **注入前新建 SQL 窗口**：不污染用户正在使用的编辑器；数据库未选择时提前报错
 - **结构化输出**：ANSI 已清理，命令回显已去除，返回纯净文本
 - **sudo 自动重试**：检测 sudo 别名劫持，询问用户后切 root 重试
 - **Arthas 安全基线**：中风险命令（trace/watch）自动补 `-n`，高风险命令（retransform/profiler/stop）无条件禁用

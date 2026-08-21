@@ -13,7 +13,28 @@
 - **插件（Chrome extension background）**：唯一，连上后发 `hello{role:extension}` 声明身份。负责上报 WS 帧、接收注入指令。
 - **Agent**：可有多个。发 `run` 请求，收 `result` 响应。
 
-## 完整消息列表
+## Yearning 多页面监听
+
+Yearning 页面必须先在 popup 的「Yearning 监听」列表中监听并选择一个页面。
+每个监听项包含页面标题、数据库名/数据源、host 和 tabId；`✓ 当前 Yearning 页面`
+表示 SQL 自动化的目标页面，`● 当前浏览器页`表示用户当前正在看的 tab。
+
+- 多个 Yearning 页面可以同时监听，但 SQL 只会注入到选中的 active tab。
+- 结果帧带 `tabId`，代理只消费与目标 tab 相同的结果，避免多个页面串结果。
+- 手动客户端可通过环境变量显式指定：`YEARNING_TAB_ID=123 node yr-example.mjs "show index from t_dk_message__8;"`
+- `yr-run` 未传 `tabId` 时使用 popup 当前选中的 Yearning 页面。
+
+### Yearning 自动化消息
+
+```json
+{ "type": "yr-run", "reqId": "abc123", "sql": "show index from t_dk_message__8;", "timeoutMs": 60000, "tabId": 123 }
+```
+
+`yr-run` 会注入 SQL、点击 Yearning 的「查 询」按钮，并等待该 tab 的 MessagePack
+WebSocket 结果帧。Yearning 结果帧是 opcode=2 二进制帧，解码后通常为
+`{ export, error, results, query_time, status, heartbeat, is_only }`。
+
+### 完整消息列表
 
 ### Agent → 代理
 

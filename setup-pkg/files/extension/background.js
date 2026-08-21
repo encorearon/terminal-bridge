@@ -16,6 +16,13 @@ let bridgeConnected = false;
 const termReadyTabs = new Set();  // 哪些 tab 的 content script 上报了 term-ready
 const termReadyFrames = new Map(); // tabId -> frameId（终端所在的 frame，注入时直接用）
 let activeTabId = null;           // 当前激活的终端 tab（命令只发它，WS 帧只收它的）
+// WS 监听（tap）模式：非终端页面（如 Yearning）没有 xterm，无法走 term-ready 激活。
+// 用户在 popup 点「监听当前页 WS」把 tab 加进 tapTabs，CDP 帧照抓照转发，
+// 代理侧按 URL 过滤喂给 tap 客户端（不经终端命令的 prompt 配对）。
+const tapTabs = new Set();
+const tapTabMeta = new Map(); // tabId -> { title, url, host, database, dataSource, label }
+let activeTapTabId = null;     // Yearning SQL 自动化使用的目标 tab
+const wsUrls = new Map();  // requestId -> url（帧转发时带上来源 URL，供 tap 过滤）
 
 // ============== 消息处理（来自 popup / content script）==============
 // 注意：listener 不能是 async——async 函数返回 Promise 而非 true，
@@ -82,6 +89,90 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // --- Yearning 监听：显式绑定 tab，并维护 active 页面 ---
+  if (msg.type === "WS_TAP_ATTACH") {
+    const tabId = msg.tabId;
+    if (tabId == null) { sendResponse({ ok: false, msg: "missing tabId" }); return false; }
+    tapTabs.add(tabId);
+    if (activeTapTabId == null) activeTapTabId = tabId;
+    attachDebugger(tabId);
+    refreshTapTabMeta(tabId).then(() => {
+      sendToBridge({ type: "yr-active-tab", tabId: activeTapTabId });
+      sendResponse({ ok: true, tabId, activeTapTabId, tabs: [...tapTabMeta.values()] });
+    });
+    return true;
+  }
+  if (msg.type === "WS_TAP_DETACH" || msg.type === "YR_TAP_DETACH") {
+    const tabId = msg.tabId;
+    tapTabs.delete(tabId);
+    tapTabMeta.delete(tabId);
+    if (activeTapTabId === tabId) activeTapTabId = [...tapTabs][0] ?? null;
+    sendResponse({ ok: true, tabId, activeTapTabId, tabs: [...tapTabMeta.values()] });
+    return false;
+  }
+  if (msg.type === "YR_TAP_SELECT") {
+    if (!tapTabs.has(msg.tabId)) {
+      sendResponse({ ok: false, msg: "该 Yearning 页面尚未监听" });
+    } else {
+      activeTapTabId = msg.tabId;
+      sendToBridge({ type: "yr-active-tab", tabId: activeTapTabId });
+      sendResponse({ ok: true, activeTapTabId });
+    }
+    return false;
+  }
+  if (msg.type === "YR_TAP_STATUS" || msg.type === "WS_TAP_STATUS") {
+    buildTapStatus().then(sendResponse);
+    return true;
+  }
+
+  // --- CSV 导出记录（popup 列表，存 session storage 防 SW 休眠丢失）---
+  if (msg.type === "CSV_LIST") {
+    getCsvExports().then(list => {
+      sendResponse({
+        ok: true,
+        exports: list.map(e => ({ id: e.id, name: e.name, rows: e.rows, sql: e.sql, time: e.time })),
+      });
+    });
+    return true;  // 异步
+  }
+  if (msg.type === "CSV_DOWNLOAD") {
+    getCsvExports().then(list => {
+      const record = list.find(e => e.id === msg.id);
+      if (!record) {
+        sendResponse({ ok: false, msg: "导出记录不存在" });
+        return;
+      }
+      chrome.downloads.download(
+        { url: record.dataUrl, filename: record.name, saveAs: true },
+        (downloadId) => {
+          if (chrome.runtime.lastError) {
+            sendResponse({ ok: false, msg: chrome.runtime.lastError.message });
+            return;
+          }
+          sendResponse({ ok: true, downloadId });
+        }
+      );
+    });
+    return true;  // 异步
+  }
+
+  // --- Yearning 自动化（探测/注入 SQL/点查询）---
+  if (msg.type === "YR_PING" || msg.type === "YR_SQL_SET" || msg.type === "YR_QUERY_CLICK") {
+    const tabId = msg.tabId != null ? msg.tabId : activeTapTabId;
+    if (tabId == null) {
+      sendResponse({ ok: false, msg: "没有选中的 Yearning 页面，请先监听并选择 tab" });
+      return false;
+    }
+    chrome.tabs.sendMessage(tabId, msg, { frameId: 0 }, (res) => {
+      if (chrome.runtime.lastError) {
+        sendResponse({ ok: false, msg: "content script 无响应: " + chrome.runtime.lastError.message });
+        return;
+      }
+      sendResponse(res || { ok: false });
+    });
+    return true;
+  }
+
   return false;
 });
 
@@ -129,6 +220,47 @@ function hostFromUrl(url) {
   } catch {
     return "";
   }
+}
+
+async function refreshTapTabMeta(tabId) {
+  let tab = null;
+  try { tab = await chrome.tabs.get(tabId); } catch { return null; }
+  const meta = {
+    tabId,
+    title: (tab.title || "Yearning").slice(0, 80),
+    url: tab.url || "",
+    host: hostFromUrl(tab.url || ""),
+    database: "",
+    dataSource: "",
+    label: tab.title || "Yearning",
+    isCurrent: false,
+    active: tabId === activeTapTabId,
+  };
+  const details = await sendFrameMessage(tabId, { type: "yr-meta" }, 0);
+  if (details?.ok) {
+    meta.database = details.database || "";
+    meta.dataSource = details.dataSource || "";
+    meta.label = details.label || meta.label;
+  }
+  tapTabMeta.set(tabId, meta);
+  return meta;
+}
+
+async function buildTapStatus() {
+  let currentTabId = null;
+  try {
+    const [current] = await chrome.tabs.query({ active: true, currentWindow: true });
+    currentTabId = current?.id ?? null;
+  } catch {}
+  for (const tabId of tapTabs) {
+    if (!tapTabMeta.has(tabId)) await refreshTapTabMeta(tabId);
+    const meta = tapTabMeta.get(tabId);
+    if (meta) {
+      meta.active = tabId === activeTapTabId;
+      meta.isCurrent = tabId === currentTabId;
+    }
+  }
+  return { ok: true, tapTabs: [...tapTabs], activeTapTabId, currentTabId, tabs: [...tapTabMeta.values()] };
 }
 
 // ============== Native Messaging（启动/停止代理）==============
@@ -202,25 +334,29 @@ function attachDebugger(tabId) {
 chrome.debugger.onEvent.addListener((source, method, params) => {
   const tabId = source.tabId;
   const isActive = tabId === activeTabId;
+  const isTap = tapTabs.has(tabId);
+  if (!isActive && !isTap) return;  // 终端激活 tab 和 tap 监听 tab 之外不上送
 
   if (method === 'Network.webSocketCreated') {
+    // 记录 requestId -> url，帧转发时带上（tap 客户端按 URL 过滤）
+    wsUrls.set(params.requestId, params.url);
     if (isActive) {
       console.log('[WS] 新连接:', params.url, '(active tab', tabId, ')');
       sendToBridge({ type: 'ws-open', payload: { url: params.url, requestId: params.requestId } });
     }
   }
   else if (method === 'Network.webSocketFrameReceived') {
-    // recv 帧是命令输出，只有 activeTabId 的才上送给代理配对
-    if (isActive) {
-      sendToBridge({
-        type: 'ws-recv',
-        payload: {
-          data: extractPayloadData(params.response),
-          opcode: params.response && params.response.opcode,
-          t: Date.now()
-        }
-      });
-    }
+    // recv 帧：终端激活 tab 的进代理配对；tap tab 的进代理 tap 通道（都带 url）
+    sendToBridge({
+      type: 'ws-recv',
+      payload: {
+        data: extractPayloadData(params.response),
+        opcode: params.response && params.response.opcode,
+        url: wsUrls.get(params.requestId) || "",
+        tabId,
+        t: Date.now()
+      }
+    });
   }
   else if (method === 'Network.webSocketFrameSent') {
     if (isActive) {
@@ -229,12 +365,15 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
         payload: {
           data: extractPayloadData(params.response),
           opcode: params.response && params.response.opcode,
+          url: wsUrls.get(params.requestId) || "",
+          tabId,
           t: Date.now()
         }
       });
     }
   }
   else if (method === 'Network.webSocketClosed') {
+    wsUrls.delete(params.requestId);
     if (isActive) sendToBridge({ type: 'ws-close', payload: { requestId: params.requestId } });
   }
   else if (method === 'Network.webSocketFrameError') {
@@ -390,11 +529,184 @@ function handleBridgeCommand(frame) {
     return;
   }
 
+  // { type: "yr-cmd", sub: "ping"|"sql-set"|"query-click", sql, reqId }
+  // Yearning 自动化：代理编排（yr-run），本插件转发到 tap tab 的 content script。
+  // sql-set 走 CDP Input.insertText（浏览器信任层级，monaco 等任何编辑器都接受）；
+  // 合成 paste/execCommand 对 monaco 无效（isTrusted=false 被忽略，实测）。
+  if (frame.type === "yr-cmd") {
+    const tabId = frame.tabId != null ? frame.tabId : activeTapTabId;
+    if (tabId == null) {
+      sendToBridge({ type: "yr-result", reqId: frame.reqId, tabId: null, ok: false, error: "no tap tab; 先在 Yearning 页面点「监听当前页 WS」" });
+      return;
+    }
+    if (frame.sub === "sql-set") {
+      yrSqlSetViaCDP(tabId, frame.sql || "", frame.reqId);
+      return;
+    }
+    const payload = frame.sub === "ping" ? { type: "yr-ping" }
+      : { type: "yr-query-click" };
+    chrome.tabs.sendMessage(tabId, payload, { frameId: 0 }, (res) => {
+      if (chrome.runtime.lastError) {
+        sendToBridge({ type: "yr-result", reqId: frame.reqId, tabId, ok: false, error: "content script 无响应: " + chrome.runtime.lastError.message });
+        return;
+      }
+      sendToBridge({ type: "yr-result", reqId: frame.reqId, tabId, ...(res || { ok: false }) });
+    });
+    return;
+  }
+
+  // { type: "yr-export-csv", payload(结果JSON), sql, rows }
+  // 代理在 yr-run 查询成功后发来：浏览器侧生成 CSV 并落下载，popup 展示列表
+  if (frame.type === "yr-export-csv") {
+    handleYrExportCsv(frame);
+    return;
+  }
+
   // { type: "ping" }
   if (frame.type === "ping") {
     sendToBridge({ type: "pong", payload: { readyTabs: [...termReadyTabs] } });
     return;
   }
+}
+
+// Yearning SQL 通过 CDP Input 注入（monaco 等编辑器接受浏览器信任层级事件）
+async function yrSqlSetViaCDP(tabId, sql, reqId) {
+  try {
+    // 未 attach 的 tab 上 Input.* 命令会静默无效 → 注入校验失败，先确保 attach
+    if (!attached[tabId]) {
+      await new Promise(resolve => attachDebugger(tabId) ?? resolve());
+      await new Promise(r => setTimeout(r, 400));  // 等 Network.enable 完成
+    }
+    // 新建 SQL 窗口：避免把 SQL 注入用户正在使用的已有编辑器
+    const newWin = await sendFrameMessage(tabId, { type: "yr-new-sql" }, 0);
+    if (!newWin || !newWin.ok) {
+      console.warn("[bg] 新建 SQL 窗口失败（继续在当前编辑器注入）:", newWin?.error);
+    }
+    // 前置校验：数据库未选择时 Yearning 查询必报错，提前失败给明确提示
+    const meta = await sendFrameMessage(tabId, { type: "yr-meta" }, 0);
+    if (meta?.ok && !meta.database) {
+      sendToBridge({
+        type: "yr-result", reqId, tabId, ok: false,
+        error: "database-not-selected",
+        message: "该 Yearning 页面未选择数据库（查询会报错）。请先在页面上选择数据库后重试。",
+      });
+      return;
+    }
+    const focused = await sendFrameMessage(tabId, { type: "yr-focus-editor" }, 0);
+    if (!focused || !focused.ok) {
+      sendToBridge({ type: "yr-result", reqId, tabId, ok: false, error: focused?.error || "cannot focus Yearning editor" });
+      return;
+    }
+    await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", {
+      type: "keyDown", key: "a", code: "KeyA", windowsVirtualKeyCode: 65,
+      nativeVirtualKeyCode: 65, modifiers: 2,
+    });
+    await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", {
+      type: "keyUp", key: "a", code: "KeyA", windowsVirtualKeyCode: 65,
+      nativeVirtualKeyCode: 65, modifiers: 2,
+    });
+    await chrome.debugger.sendCommand({ tabId }, "Input.insertText", { text: sql });
+    await new Promise(r => setTimeout(r, 400));
+    let verified = await sendFrameMessage(tabId, { type: "yr-verify-sql", sql }, 0);
+    // 校验失败重试一次（编辑器渲染慢/焦点竞争时首轮 insertText 可能丢）
+    if (!verified?.ok) {
+      const refocus = await sendFrameMessage(tabId, { type: "yr-focus-editor" }, 0);
+      if (refocus?.ok) {
+        await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", {
+          type: "keyDown", key: "a", code: "KeyA", windowsVirtualKeyCode: 65,
+          nativeVirtualKeyCode: 65, modifiers: 2,
+        });
+        await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", {
+          type: "keyUp", key: "a", code: "KeyA", windowsVirtualKeyCode: 65,
+          nativeVirtualKeyCode: 65, modifiers: 2,
+        });
+        await chrome.debugger.sendCommand({ tabId }, "Input.insertText", { text: sql });
+        await new Promise(r => setTimeout(r, 500));
+        verified = await sendFrameMessage(tabId, { type: "yr-verify-sql", sql }, 0);
+      }
+    }
+      sendToBridge({
+      type: "yr-result", reqId, tabId, ok: !!verified?.ok,
+      via: "cdp-input", error: verified?.ok ? undefined : "CDP 注入后编辑器读回校验失败",
+      info: verified?.editorText,
+    });
+  } catch (err) {
+    sendToBridge({ type: "yr-result", reqId, tabId, ok: false, error: "CDP SQL 注入失败: " + err.message });
+  }
+}
+
+function sendFrameMessage(tabId, msg, frameId) {
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, msg, { frameId }, (res) => {
+      if (chrome.runtime.lastError) { resolve(null); return; }
+      resolve(res || null);
+    });
+  });
+}
+
+// ===================== Yearning CSV 导出 =====================
+// 导出记录存 chrome.storage.session（MV3 service worker 会休眠，
+// 内存数组 30s 就丢；session 存储跨 SW 重启保留、浏览器关闭即清空，
+// 正好匹配"最近导出"的语义）。dataUrl 存在记录里，重新下载不依赖原始文件。
+const CSV_STORAGE_KEY = "yrCsvExports";
+const CSV_MAX_RECORDS = 20;
+
+async function getCsvExports() {
+  try {
+    const r = await chrome.storage.session.get(CSV_STORAGE_KEY);
+    return r[CSV_STORAGE_KEY] || [];
+  } catch { return []; }
+}
+
+async function addCsvExport(record) {
+  const list = await getCsvExports();
+  list.unshift(record);
+  if (list.length > CSV_MAX_RECORDS) list.length = CSV_MAX_RECORDS;
+  try { await chrome.storage.session.set({ [CSV_STORAGE_KEY]: list }); } catch {}
+}
+
+function csvCell(value) {
+  if (value == null) return "";
+  const s = String(value);
+  if (/[",\r\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+
+// Yearning 结果 JSON → CSV 文本。多结果集时只取第一个非空表
+// （Yearning 对 SHOW INDEX 会推两份相同结果，取一即可）
+function resultJsonToCsv(jsonText) {
+  let obj;
+  try { obj = JSON.parse(jsonText); } catch { return null; }
+  if (!Array.isArray(obj.results)) return null;
+  const table = obj.results.find(t => t && Array.isArray(t.field) && t.field.length > 0)
+    || obj.results[0];
+  if (!table || !Array.isArray(table.field)) return null;
+  const headers = table.field.map(f => csvCell(f.title || f.dataIndex || ""));
+  const rows = (table.data || []).map(row =>
+    table.field.map(f => csvCell(row[f.dataIndex])).join(",")
+  );
+  return "\uFEFF" + [headers.join(","), ...rows].join("\r\n") + "\r\n";
+}
+
+async function handleYrExportCsv(frame) {
+  const csv = resultJsonToCsv(frame.payload || "");
+  if (!csv) {
+    console.warn("[bg] yr-export-csv: 结果 JSON 解析失败或无表结构");
+    return;
+  }
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const sqlHead = (frame.sql || "query").slice(0, 30).replace(/[^\w-]+/g, "_");
+  const name = `yearning-${sqlHead}-${stamp}.csv`;
+  const dataUrl = "data:text/csv;charset=utf-8," + encodeURIComponent(csv);
+  await addCsvExport({
+    id: Date.now(),
+    name,
+    rows: frame.rows || 0,
+    sql: frame.sql || "",
+    time: Date.now(),
+    dataUrl,
+  });
+  console.log("[bg] CSV 导出已记录:", name, `(${frame.rows} 行)，可在 popup 点击下载`);
 }
 
 // 把命令注入到 activeTabId 的终端 frame。
@@ -533,6 +845,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   delete attached[tabId];
   termReadyTabs.delete(tabId);
   termReadyFrames.delete(tabId);
+  tapTabs.delete(tabId);
   // 关闭的是 activeTabId 就清空，让下次自动选或用户重选
   if (activeTabId === tabId) {
     activeTabId = null;

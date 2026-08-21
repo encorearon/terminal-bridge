@@ -13,6 +13,7 @@
 
 import { WebSocketServer } from "ws";
 import { randomBytes } from "node:crypto";
+import { decode as msgpackDecode } from "@msgpack/msgpack";
 import { writeFileSync, unlinkSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -51,6 +52,206 @@ function sendToExtension(obj) {
     return true;
   }
   return false;
+}
+
+// ===================== WS 监听（tap）通道 =====================
+// 非终端页面（Yearning SQL 结果等）没有 xterm/prompt，无法走命令配对。
+// Agent 客户端发 {type:"tap-start", urlIncludes:"..."} 注册后，代理把
+// URL 匹配的原始 ws-recv 帧以 {type:"tap-frame", ...} 转发给它，由 Agent
+// 自行解析协议。与终端命令通道互不影响（终端配对只吃终端特征 URL）。
+const tapClients = new Map();  // ws -> { urlIncludes, tabId? }
+let activeYearningTabId = null;  // background 选中的 Yearning tab
+
+function broadcastTap(payload) {
+  // 内部 Yearning 编排等待者也吃一份（yr-run 等结果帧）
+  feedYearningWaiters(payload);
+  if (tapClients.size === 0) return;
+  const url = (payload && payload.url) || "";
+  for (const [client, filter] of tapClients) {
+    if (client.readyState !== client.OPEN) continue;
+    // url 匹配则转发；url 为空也转发（CDP 在 attach 前建立的连接会错过
+    // webSocketCreated，帧拿不到 url——宁可多送让客户端判断，不能静默丢弃）
+    if (filter.tabId != null && payload.tabId != null && filter.tabId !== payload.tabId) continue;
+    if (url && url.indexOf(filter.urlIncludes) === -1) continue;
+    try {
+      client.send(JSON.stringify({
+        type: "tap-frame",
+        tabId: payload.tabId,
+        url,
+        data: payload.data,
+        opcode: payload.opcode,
+        t: payload.t
+      }));
+    } catch {}
+  }
+}
+
+// ===================== Yearning SQL 自动化编排 =====================
+// Agent 发 {type:"yr-run", sql, timeoutMs}：
+//   1. yr-cmd sql-set   → 插件把 SQL 注入 Yearning 编辑器（CodeMirror/monaco/DOM）
+//   2. yr-cmd query-click → 插件点「查询」按钮
+//   3. 等 tap 帧里出现 results != null 的结果帧（msgpack 解码）→ resolve 返回
+// 前置条件：用户已在 Yearning 页面点「📡 监听当前页 WS」（tap tab 存在）。
+const yrCmdWaiters = new Map();  // reqId -> resolve
+const yrRunWaiters = new Set();  // { tryConsume(payload) -> boolean }
+
+function sendYrCmd(sub, sql, tabId) {
+  const reqId = genReqId();
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      yrCmdWaiters.delete(reqId);
+      resolve({ ok: false, error: `yr-cmd ${sub} timeout` });
+    }, 5000);
+    yrCmdWaiters.set(reqId, (res) => {
+      clearTimeout(timer);
+      resolve(res);
+    });
+    const ok = sendToExtension({ type: "yr-cmd", sub, sql, reqId, tabId });
+    if (!ok) {
+      yrCmdWaiters.delete(reqId);
+      clearTimeout(timer);
+      resolve({ ok: false, error: "extension not connected" });
+    }
+  });
+}
+
+// 插件回的 yr-result：唤醒对应的 yr-cmd 等待者
+function handleYrResult(msg) {
+  const waiter = yrCmdWaiters.get(msg.reqId);
+  if (waiter) {
+    yrCmdWaiters.delete(msg.reqId);
+    waiter({ ok: !!msg.ok, via: msg.via, error: msg.error, info: msg.editor || msg.buttons });
+  }
+}
+
+// tap 帧喂给 yr-run 等待者：结果帧（msgpack 解码后 results 非空）被消费。
+// 没有 yr-run 等待者时（用户在页面上手点「查 询」），同样生成 CSV 导出记录——
+// 桥接查询和手动查询的产出统一进 popup 列表。
+function feedYearningWaiters(payload) {
+  const url = (payload && payload.url) || "";
+  if (url && url.indexOf("sql.meiyunji.net") === -1) return;
+  const frameTabId = payload && payload.tabId;
+
+  const opcode = payload && payload.opcode;
+  const data = payload && payload.data;
+  if (opcode !== 2 || typeof data !== "string") return;
+  let obj = null;
+  try {
+    obj = msgpackDecode(Buffer.from(data, "base64"));
+  } catch { return; }
+  if (!obj || obj.results == null) return;  // 心跳帧忽略
+
+  let consumed = false;
+  if (yrRunWaiters.size > 0) {
+    for (const waiter of [...yrRunWaiters]) {
+      // tabId 双向可识别时严格隔离；帧缺 tabId（attach 前建立的旧 WS 连接，
+      // CDP 拿不到 webSocketCreated）时：仅当恰好只有一个 waiter 才兜底消费——
+      // 多 waiter 场景宁可不消费走超时，也不能猜错页面串结果。
+      if (waiter.tabId != null && payload.tabId != null && waiter.tabId !== payload.tabId) continue;
+      if (waiter.tabId != null && payload.tabId == null && yrRunWaiters.size > 1) continue;
+      if (waiter.tryConsume(obj)) { consumed = true; break; }
+    }
+  }
+
+  // 未被 yr-run 消费的结果帧 = 手动查询（或 yr-run 已完成后的重复帧），
+  // 也生成 CSV 记录。同一帧 yr-run 路径已经发过 export，不重复。
+  if (!consumed) {
+    const rows = Array.isArray(obj.results)
+      ? obj.results.map(t => (t && t.data ? t.data.length : 0)).reduce((a, b) => a + b, 0)
+      : 0;
+    sendToExtension({
+      type: "yr-export-csv",
+      reqId: "manual-" + genReqId(),
+      tabId: frameTabId ?? activeYearningTabId,
+      sql: "manual-query",
+      rows,
+      payload: JSON.stringify(obj),
+    });
+  }
+}
+
+async function handleYrRun(ws, msg) {
+  const reqId = msg.reqId || genReqId();
+  const sql = (msg.sql || "").toString();
+  const tabId = msg.tabId != null ? Number(msg.tabId) : activeYearningTabId;
+  const timeoutMs = Math.min(Number(msg.timeoutMs || 60000), 300000);
+  if (!sql.trim()) {
+    ws.send(JSON.stringify({ type: "result", reqId, ok: false, error: "empty sql" }));
+    return;
+  }
+
+  // 结果帧等待者：收到第一个 results 非空帧即完成
+  let settled = false;
+  const runEntry = {
+    tabId,
+    sentAt: Date.now(),
+    tryConsume: (obj) => {
+      if (settled) return true;
+      settled = true;
+      yrRunWaiters.delete(runEntry);
+      console.log(TAG, `[yr-run ${reqId}] 结果帧到达（query_time=${obj.query_time ?? "?"}）`);
+      // 同步发给插件：浏览器侧生成 CSV 落下载（popup 可见、可重新下载）
+      sendToExtension({
+        type: "yr-export-csv",
+        reqId,
+        tabId: tabId ?? activeYearningTabId,
+        sql: sql.slice(0, 120),
+        rows: Array.isArray(obj.results)
+          ? obj.results.map(t => (t && t.data ? t.data.length : 0)).reduce((a, b) => a + b, 0)
+          : 0,
+        payload: JSON.stringify(obj),
+      });
+      ws.send(JSON.stringify({
+        type: "result", reqId, ok: true,
+        output: JSON.stringify(obj),
+        elapsedMs: Date.now() - runEntry.sentAt,
+      }));
+      return true;
+    },
+  };
+  yrRunWaiters.add(runEntry);
+
+  const timer = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    yrRunWaiters.delete(runEntry);
+    ws.send(JSON.stringify({
+      type: "result", reqId, ok: false, error: "timeout",
+      message: "Yearning 查询未在时限内返回结果帧（确认页面已点「监听当前页 WS」且查询能正常执行）",
+      elapsedMs: Date.now() - runEntry.sentAt,
+    }));
+  }, timeoutMs);
+
+  // 1. 注入 SQL
+  const setRes = await sendYrCmd("sql-set", sql, tabId);
+  if (!setRes.ok) {
+    if (!settled) {
+      settled = true;
+      yrRunWaiters.delete(runEntry);
+      clearTimeout(timer);
+      ws.send(JSON.stringify({ type: "result", reqId, ok: false, error: "sql-set failed: " + (setRes.error || ""), message: "SQL 注入 Yearning 编辑器失败" }));
+    }
+    return;
+  }
+  console.log(TAG, `[yr-run ${reqId}] SQL 已注入（via ${setRes.via}）`);
+
+  // 2. 点「查询」
+  const clickRes = await sendYrCmd("query-click", "", tabId);
+  if (!clickRes.ok) {
+    if (!settled) {
+      settled = true;
+      yrRunWaiters.delete(runEntry);
+      clearTimeout(timer);
+      ws.send(JSON.stringify({
+        type: "result", reqId, ok: false,
+        error: "query-click failed: " + (clickRes.error || ""),
+        message: "未找到「查询」按钮；页面按钮: " + JSON.stringify(clickRes.info || []).slice(0, 300),
+      }));
+    }
+    return;
+  }
+  console.log(TAG, `[yr-run ${reqId}] 已点「查询」（via ${clickRes.via}），等待结果帧...`);
+  // 3. 结果帧由 feedYearningWaiters 消费（timer 兜底）
 }
 
 // ===================== 请求-响应配对 =====================
@@ -676,9 +877,64 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
+    // --- Agent 发来的 Yearning SQL 查询（注入编辑器 + 点查询 + 收 WS 结果）---
+    if (msg.type === "yr-run") {
+      handleYrRun(ws, msg);
+      return;
+    }
+    if (msg.type === "yr-result") {
+      handleYrResult(msg);
+      return;
+    }
+    if (msg.type === "yr-active-tab") {
+      activeYearningTabId = msg.tabId != null ? Number(msg.tabId) : null;
+      console.log(TAG, `[yr] active tab = ${activeYearningTabId}`);
+      return;
+    }
+    if (msg.type === "yr-ping") {
+      // 探测：编辑器类型 + 查询按钮（不执行任何操作）
+      sendYrCmd("ping", "", msg.tabId != null ? Number(msg.tabId) : activeYearningTabId).then(r => {
+        ws.send(JSON.stringify({ type: "result", reqId: msg.reqId || "", ok: r.ok, output: JSON.stringify({ via: r.via, error: r.error, info: r.info }, null, 1) }));
+      });
+      return;
+    }
+    if (msg.type === "yr-set") {
+      // 只注入 SQL 不点查询（用户手动点，配合 tap 探针收结果）
+      sendYrCmd("sql-set", msg.sql || "", msg.tabId != null ? Number(msg.tabId) : activeYearningTabId).then(r => {
+        ws.send(JSON.stringify({ type: "result", reqId: msg.reqId || "", ok: r.ok, output: JSON.stringify({ via: r.via, error: r.error }) }));
+      });
+      return;
+    }
+
+    // --- Agent 发来的 WS 监听（tap）请求：非终端页面（Yearning 等）的帧流 ---
+    if (msg.type === "tap-start") {
+      const urlIncludes = (msg.urlIncludes || "").toString();
+      if (!urlIncludes) {
+        ws.send(JSON.stringify({ type: "tap-error", error: "missing urlIncludes" }));
+        return;
+      }
+      const tapTabId = msg.tabId != null ? Number(msg.tabId) : null;
+      tapClients.set(ws, { urlIncludes, tabId: tapTabId });
+      console.log(TAG, `tap client 已注册 (urlIncludes=${urlIncludes}, tabId=${tapTabId}, total=${tapClients.size})`);
+      ws.send(JSON.stringify({ type: "tap-started", urlIncludes }));
+      return;
+    }
+    if (msg.type === "tap-stop") {
+      tapClients.delete(ws);
+      console.log(TAG, `tap client 已注销 (total=${tapClients.size})`);
+      ws.send(JSON.stringify({ type: "tap-stopped" }));
+      return;
+    }
+
     // --- 插件上报的 WS 帧 ---
     if (msg.type === "ws-recv") {
-      handleWsRecv(msg.payload);
+      // 先喂 tap 通道（按 URL 过滤转发原始帧），再喂终端配对。
+      // 终端配对只吃终端特征的 URL（koko / arthas / 空 = 旧插件不带 url），
+      // 防止 tap 页面（Yearning JSON 帧）污染终端命令的输出配对。
+      broadcastTap(msg.payload);
+      const frameUrl = (msg.payload && msg.payload.url) || "";
+      const isTerminalUrl = !frameUrl || /\/koko\/ws|connectArthas/i.test(frameUrl);
+      if (isTerminalUrl) handleWsRecv(msg.payload);
       return;
     }
     if (msg.type === "ws-send") {
@@ -707,6 +963,9 @@ wss.on("connection", (ws, req) => {
 
   ws.on("close", () => {
     clients.delete(ws);
+    if (tapClients.delete(ws)) {
+      console.log(TAG, `tap client 已断开 (total=${tapClients.size})`);
+    }
     if (ws === extensionWs) {
       extensionWs = null;
       console.log(TAG, "extension 已断开");

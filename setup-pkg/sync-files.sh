@@ -25,6 +25,8 @@ echo "→ proxy/"
 cp "$PROJECT_DIR"/proxy/server.js "$FILES_DIR/proxy/"
 cp "$PROJECT_DIR"/proxy/arthas-guard.js "$FILES_DIR/proxy/"
 cp "$PROJECT_DIR"/proxy/client-example.mjs "$FILES_DIR/proxy/"
+cp "$PROJECT_DIR"/proxy/tap-example.mjs "$FILES_DIR/proxy/"
+cp "$PROJECT_DIR"/proxy/yr-example.mjs "$FILES_DIR/proxy/"
 cp "$PROJECT_DIR"/proxy/package.json "$FILES_DIR/proxy/"
 # 不带 package-lock（让 npm install 在目标机器上重新解析）
 # 不带 node_modules（太大，目标机器上 npm install）
@@ -43,6 +45,8 @@ echo "→ extension/"
 cp "$PROJECT_DIR"/manifest.json "$FILES_DIR/extension/"
 cp "$PROJECT_DIR"/background.js "$FILES_DIR/extension/"
 cp "$PROJECT_DIR"/content.js "$FILES_DIR/extension/"
+cp "$PROJECT_DIR"/content-yearning.js "$FILES_DIR/extension/"
+cp "$PROJECT_DIR"/content-yearning-main.js "$FILES_DIR/extension/"
 cp "$PROJECT_DIR"/popup.html "$FILES_DIR/extension/"
 cp "$PROJECT_DIR"/popup.js "$FILES_DIR/extension/"
 
@@ -54,7 +58,7 @@ cp "$PROJECT_DIR"/skill/references/protocol.md "$FILES_DIR/skill/references/"
 
 # 校验关键文件都在
 for f in proxy/server.js proxy/arthas-guard.js native/install.sh native/host.sh.template \
-         extension/manifest.json extension/background.js extension/content.js extension/popup.html extension/popup.js \
+         extension/manifest.json extension/background.js extension/content.js extension/content-yearning.js extension/content-yearning-main.js extension/popup.html extension/popup.js \
          skill/SKILL.md skill/references/protocol.md; do
   if [ ! -f "$FILES_DIR/$f" ]; then
     echo "✗ 缺少 $f" >&2

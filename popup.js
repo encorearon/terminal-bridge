@@ -75,6 +75,97 @@ document.getElementById('btnXtermScan').onclick = () => {
   });
 };
 
+// ============== Yearning 监听（多 tab 绑定）==============
+const btnWsTap = document.getElementById('btnWsTap');
+const wsTapStatus = document.getElementById('wsTapStatus');
+const yearningTabList = document.getElementById('yearningTabList');
+
+function refreshYearningTabs() {
+  chrome.runtime.sendMessage({ type: 'YR_TAP_STATUS' }, (res) => {
+    if (chrome.runtime.lastError || !res || !res.ok) return;
+    const tabs = res.tabs || [];
+    wsTapStatus.textContent = tabs.length
+      ? `${tabs.length} 个 Yearning 页面已监听，当前选中 1 个`
+      : '未监听 Yearning 页面';
+    yearningTabList.innerHTML = tabs.map(t => {
+      const title = escapeHtml(t.title || 'Yearning');
+      const label = escapeHtml(t.label || [t.database, t.dataSource].filter(Boolean).join(' · ') || t.host || '数据库信息读取中');
+      const host = escapeHtml(t.host || `tab ${t.tabId}`);
+      return `<div class="yearning-item ${t.active ? 'active' : ''}" data-tabid="${t.tabId}">
+        <div class="yr-title">${t.active ? '◉' : '○'} ${title}${t.active ? '<span class="yr-badge">✓ 当前 Yearning 页面</span>' : ''}${t.isCurrent ? '<span class="yr-badge">● 当前浏览器页</span>' : ''}</div>
+        <div class="yr-meta">${label} · ${host}</div>
+      </div>`;
+    }).join('');
+    yearningTabList.querySelectorAll('.yearning-item').forEach(el => {
+      el.onclick = () => {
+        chrome.runtime.sendMessage({ type: 'YR_TAP_SELECT', tabId: Number(el.dataset.tabid) }, () => refreshYearningTabs());
+      };
+    });
+    // 按钮文案按「当前浏览器页是否在监听」决定（不是看 active 选中页）
+    const thisTabWatched = tabs.some(t => t.isCurrent);
+    btnWsTap.textContent = thisTabWatched ? '⏹ 停止监听当前 Yearning 页' : '📡 监听当前 Yearning 页';
+  });
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, ch => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[ch]));
+}
+
+btnWsTap.onclick = () => {
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    const tab = tabs && tabs[0];
+    if (!tab || !tab.id) { wsTapStatus.textContent = '未找到当前页'; return; }
+    // 先查当前状态：已在监听 → 停止；未监听 → 添加
+    chrome.runtime.sendMessage({ type: 'YR_TAP_STATUS' }, (st) => {
+      if (chrome.runtime.lastError || !st || !st.ok) {
+        wsTapStatus.textContent = '状态查询失败';
+        return;
+      }
+      const already = (st.tapTabs || []).includes(tab.id);
+      const type = already ? 'WS_TAP_DETACH' : 'WS_TAP_ATTACH';
+      chrome.runtime.sendMessage({ type, tabId: tab.id }, (res) => {
+        if (chrome.runtime.lastError || !res || !res.ok) {
+          wsTapStatus.textContent = (already ? '停止失败: ' : '监听失败: ') + (res && res.msg || '无响应');
+          return;
+        }
+        wsTapStatus.textContent = already ? '已停止监听该页面' : '已监听';
+        refreshYearningTabs();
+      });
+    });
+  });
+};
+
+refreshYearningTabs();
+
+// ============== CSV 导出记录 ==============
+const csvSection = document.getElementById('csvSection');
+const csvList = document.getElementById('csvList');
+
+function refreshCsvList() {
+  chrome.runtime.sendMessage({ type: 'CSV_LIST' }, (res) => {
+    if (chrome.runtime.lastError || !res || !res.ok) return;
+    const exports = res.exports || [];
+    csvSection.style.display = exports.length ? 'block' : 'none';
+    csvList.innerHTML = exports.map(e => {
+      const time = new Date(e.time).toLocaleTimeString();
+      return `<div class="csv-item" data-id="${e.id}" title="${escapeHtml(e.sql || e.name)}">
+        <span class="csv-name">📄 ${escapeHtml(e.name)}</span>
+        <span class="csv-rows">${e.rows} 行 · ${time}</span>
+      </div>`;
+    }).join('');
+    csvList.querySelectorAll('.csv-item').forEach(el => {
+      el.onclick = () => {
+        chrome.runtime.sendMessage({ type: 'CSV_DOWNLOAD', id: Number(el.dataset.id) }, (r) => {
+          if (chrome.runtime.lastError || !r || !r.ok) {
+            console.warn('重新下载失败:', r && r.msg);
+          }
+        });
+      };
+    });
+  });
+}
+refreshCsvList();
+
 // ============== 代理控制 ==============
 const proxyDot = document.getElementById('proxyDot');
 const proxyText = document.getElementById('proxyStatusText');
@@ -176,7 +267,7 @@ document.getElementById('btnCopyInstall').onclick = () => {
 };
 
 // 定时刷新（popup 打开期间）
-setInterval(() => { refreshXterm(); refreshProxy(); }, 3000);
+setInterval(() => { refreshXterm(); refreshProxy(); refreshCsvList(); refreshYearningTabs(); }, 3000);
 refreshXterm();
 refreshProxy();
 // 启动时主动探测一次 native host：发个 status，失败就显示安装提示
