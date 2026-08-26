@@ -200,10 +200,14 @@
     <div class="hint" id="wsTapStatus">未监听 Yearning 页面</div>
     <div id="yearningTabList" style="margin-top:6px;"></div>
     <div id="csvSection" style="margin-top:8px;display:none;">
-      <div class="section-title" style="margin-bottom:4px;">CSV 导出记录</div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
+        <span class="section-title" style="margin:0;">CSV 导出记录</span>
+        <button class="copy-btn" id="btnCsvClear" style="background:#e53935;">清空</button>
+      </div>
       <div id="csvList"></div>
-      <div class="hint">点击记录可重新下载（仅保留最近 20 条，插件刷新后清空）</div>
+      <div class="hint">点击记录下载 · 表名_库_数据源_日期.csv</div>
     </div>
+    <button class="scan" id="btnCopyPrompt" style="margin-top:8px;background:#7c4dff;">📋 复制 Agent 使用 Prompt</button>
   </div>
 
   <div class="section">

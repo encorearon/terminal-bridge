@@ -144,8 +144,10 @@ const csvList = document.getElementById('csvList');
 function refreshCsvList() {
   chrome.runtime.sendMessage({ type: 'CSV_LIST' }, (res) => {
     if (chrome.runtime.lastError || !res || !res.ok) return;
-    const exports = res.exports || [];
-    csvSection.style.display = exports.length ? 'block' : 'none';
+    const all = res.exports || [];
+    csvSection.style.display = all.length ? 'block' : 'none';
+    // 只显示最近 5 条，popup 不超长（存储仍保留 20 条）
+    const exports = all.slice(0, 5);
     csvList.innerHTML = exports.map(e => {
       const time = new Date(e.time).toLocaleTimeString();
       return `<div class="csv-item" data-id="${e.id}" title="${escapeHtml(e.sql || e.name)}">
@@ -165,6 +167,41 @@ function refreshCsvList() {
   });
 }
 refreshCsvList();
+
+// 清空 CSV 导出记录
+document.getElementById('btnCsvClear').onclick = () => {
+  chrome.runtime.sendMessage({ type: 'CSV_CLEAR' }, () => refreshCsvList());
+};
+
+// 复制 Agent 使用 Prompt（粘给任意 AI 助手即可用桥接查 Yearning）
+const AGENT_PROMPT = `你的机器上已装好 Terminal Bridge（Yearning SQL 桥接）。请按以下方式查询数据库：
+
+## 查询（Yearning）
+cd ~/.terminal-bridge/proxy && node yr-example.mjs "SELECT ...;" [超时ms]
+
+返回 JSON：{ ok, output(结果 JSON: field 列定义 + data 数据行), error }。
+
+## 说明
+- SQL 会自动注入到用户浏览器里选中的 Yearning 页面并点「查询」，结果自动返回
+- 前置：用户已在 Yearning 页面选择数据库，且插件 popup 已「监听当前 Yearning 页」
+- 多个 Yearning 页面时：用户在 popup 列表点选目标页面（显示 数据源 · 数据库）
+- 报 database-not-selected = 页面未选数据库，请让用户先选
+- 报 timeout = 查询超时或页面未监听，让用户确认 popup 状态
+- 只读查询即可；每次查询的结果会自动出现在插件 popup 的「CSV 导出记录」里供用户下载
+
+## 终端命令（JumpServer/Arthas，同一代理）
+cd ~/.terminal-bridge/proxy && node client-example.mjs "linux 命令" [超时ms]
+多层引号命令加 --b64 参数下发。`;
+
+document.getElementById('btnCopyPrompt').onclick = () => {
+  navigator.clipboard.writeText(AGENT_PROMPT).then(() => {
+    const btn = document.getElementById('btnCopyPrompt');
+    btn.textContent = '✓ 已复制，粘贴给 Agent 即可';
+    setTimeout(() => { btn.textContent = '📋 复制 Agent 使用 Prompt'; }, 2000);
+  }).catch(() => {
+    console.warn('复制失败');
+  });
+};
 
 // ============== 代理控制 ==============
 const proxyDot = document.getElementById('proxyDot');

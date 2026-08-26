@@ -135,6 +135,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     });
     return true;  // 异步
   }
+  if (msg.type === "CSV_CLEAR") {
+    chrome.storage.session.remove(CSV_STORAGE_KEY).catch(() => {});
+    sendResponse({ ok: true });
+    return false;
+  }
   if (msg.type === "CSV_DOWNLOAD") {
     getCsvExports().then(list => {
       const record = list.find(e => e.id === msg.id);
@@ -688,15 +693,27 @@ function resultJsonToCsv(jsonText) {
   return "\uFEFF" + [headers.join(","), ...rows].join("\r\n") + "\r\n";
 }
 
+// 文件名：表名_库_数据源_日期。表名从 SQL 提取（from/into/update 后的词），
+// 库和数据源从目标 tab 的 meta（tapTabMeta）取。
+function buildCsvFileName(sql, tabId) {
+  const sqlText = sql || "";
+  const tableMatch = sqlText.match(/\b(?:from|into|update|join)\s+[`"]?(\w+)[`"]?/i);
+  const table = (tableMatch ? tableMatch[1] : "query").slice(0, 40);
+  const meta = tapTabMeta.get(tabId) || {};
+  const database = (meta.database || "").replace(/[^\w.-]+/g, "") || "nodb";
+  const source = (meta.dataSource || "").split(" · ")[0].replace(/[^\w.-]+/g, "") || "nosrc";
+  const date = new Date().toISOString().slice(0, 10);
+  const time = new Date().toTimeString().slice(0, 5).replace(":", "");
+  return `${table}_${database}_${source}_${date}_${time}.csv`;
+}
+
 async function handleYrExportCsv(frame) {
   const csv = resultJsonToCsv(frame.payload || "");
   if (!csv) {
     console.warn("[bg] yr-export-csv: 结果 JSON 解析失败或无表结构");
     return;
   }
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  const sqlHead = (frame.sql || "query").slice(0, 30).replace(/[^\w-]+/g, "_");
-  const name = `yearning-${sqlHead}-${stamp}.csv`;
+  const name = buildCsvFileName(frame.sql, frame.tabId);
   const dataUrl = "data:text/csv;charset=utf-8," + encodeURIComponent(csv);
   await addCsvExport({
     id: Date.now(),
