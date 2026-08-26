@@ -148,13 +148,38 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return;
       }
       chrome.downloads.download(
-        { url: record.dataUrl, filename: record.name, saveAs: true },
+        { url: record.dataUrl, filename: "yearning-csv/" + record.name, saveAs: false },
         (downloadId) => {
           if (chrome.runtime.lastError) {
             sendResponse({ ok: false, msg: chrome.runtime.lastError.message });
             return;
           }
-          sendResponse({ ok: true, downloadId });
+          sendResponse({ ok: true, downloadId, path: "~/Downloads/yearning-csv/" + record.name });
+        }
+      );
+    });
+    return true;  // 异步
+  }
+  if (msg.type === "CSV_PROMPT") {
+    // 🤖 按钮：静默下载该文件到固定目录，返回让 Agent 读文件的 prompt
+    getCsvExports().then(list => {
+      const record = list.find(e => e.id === msg.id);
+      if (!record) {
+        sendResponse({ ok: false, msg: "导出记录不存在" });
+        return;
+      }
+      chrome.downloads.download(
+        { url: record.dataUrl, filename: "yearning-csv/" + record.name, saveAs: false },
+        (downloadId) => {
+          if (chrome.runtime.lastError) {
+            sendResponse({ ok: false, msg: chrome.runtime.lastError.message });
+            return;
+          }
+          const table = record.table || record.name.split("_")[0];
+          sendResponse({
+            ok: true,
+            prompt: `表名${table}的查询结果请读这个文件 ~/Downloads/yearning-csv/${record.name}`,
+          });
         }
       );
     });
@@ -677,34 +702,47 @@ function csvCell(value) {
   return s;
 }
 
-// Yearning 结果 JSON → CSV 文本。多结果集时只取第一个非空表
-// （Yearning 对 SHOW INDEX 会推两份相同结果，取一即可）
+// Yearning 结果 JSON → CSV 文本。多结果集全部写入同一个 CSV，不能只取第一张表：
+// 一次执行多条 SQL 时 results 有多项，popup 行数是总和，文件也必须包含总和。
+// 每组结果独立表头，组间用 Result Set 标记和空行分隔，兼容不同 SQL 的列结构。
 function resultJsonToCsv(jsonText) {
   let obj;
   try { obj = JSON.parse(jsonText); } catch { return null; }
   if (!Array.isArray(obj.results)) return null;
-  const table = obj.results.find(t => t && Array.isArray(t.field) && t.field.length > 0)
-    || obj.results[0];
-  if (!table || !Array.isArray(table.field)) return null;
-  const headers = table.field.map(f => csvCell(f.title || f.dataIndex || ""));
-  const rows = (table.data || []).map(row =>
-    table.field.map(f => csvCell(row[f.dataIndex])).join(",")
-  );
-  return "\uFEFF" + [headers.join(","), ...rows].join("\r\n") + "\r\n";
+
+  const blocks = [];
+  obj.results.forEach((table, index) => {
+    if (!table || !Array.isArray(table.field) || table.field.length === 0) return;
+    const headers = table.field.map(f => csvCell(f.title || f.dataIndex || ""));
+    const rows = (table.data || []).map(row =>
+      table.field.map(f => csvCell(row[f.dataIndex])).join(",")
+    );
+    // 多结果集时保留组标记；单结果集不额外增加噪音
+    if (obj.results.filter(t => t && Array.isArray(t.field) && t.field.length > 0).length > 1) {
+      blocks.push(`-- Result Set ${index + 1} --`);
+    }
+    blocks.push(headers.join(","), ...rows, "");
+  });
+  return blocks.length > 0 ? "\uFEFF" + blocks.join("\r\n") : null;
 }
 
 // 文件名：表名_库_数据源_日期。表名从 SQL 提取（from/into/update 后的词），
 // 库和数据源从目标 tab 的 meta（tapTabMeta）取。
-function buildCsvFileName(sql, tabId) {
-  const sqlText = sql || "";
+// 手动查询（sql 为 manual-query）时先读编辑器里的实际 SQL 再提取表名。
+async function buildCsvFileName(sql, tabId) {
+  let sqlText = sql || "";
+  if (!sqlText || sqlText === "manual-query") {
+    const editor = await sendFrameMessage(tabId, { type: "yr-sql-get" }, 0);
+    if (editor?.ok && editor.sql) sqlText = editor.sql;  // 手动查询后编辑器里就是刚执行的 SQL
+  }
   const tableMatch = sqlText.match(/\b(?:from|into|update|join)\s+[`"]?(\w+)[`"]?/i);
-  const table = (tableMatch ? tableMatch[1] : "query").slice(0, 40);
+  const table = (tableMatch ? tableMatch[1] : "").slice(0, 40) || "query";
   const meta = tapTabMeta.get(tabId) || {};
-  const database = (meta.database || "").replace(/[^\w.-]+/g, "") || "nodb";
+  const database = (meta.database || "").replace(/[^\w-]+/g, "") || "nodb";
   const source = (meta.dataSource || "").split(" · ")[0].replace(/[^\w.-]+/g, "") || "nosrc";
   const date = new Date().toISOString().slice(0, 10);
   const time = new Date().toTimeString().slice(0, 5).replace(":", "");
-  return `${table}_${database}_${source}_${date}_${time}.csv`;
+  return { name: `${table}_${database}_${source}_${date}_${time}.csv`, table };
 }
 
 async function handleYrExportCsv(frame) {
@@ -713,11 +751,12 @@ async function handleYrExportCsv(frame) {
     console.warn("[bg] yr-export-csv: 结果 JSON 解析失败或无表结构");
     return;
   }
-  const name = buildCsvFileName(frame.sql, frame.tabId);
+  const { name, table } = await buildCsvFileName(frame.sql, frame.tabId);
   const dataUrl = "data:text/csv;charset=utf-8," + encodeURIComponent(csv);
   await addCsvExport({
     id: Date.now(),
     name,
+    table,
     rows: frame.rows || 0,
     sql: frame.sql || "",
     time: Date.now(),

@@ -107,7 +107,8 @@
       if (idc && idc !== dataSource) dataSource = dataSource ? `${dataSource} · ${idc}` : idc;
     } catch {}
 
-    // 3. 兜底：form 启发式
+    // 3. 兜底：form 启发式（排除与 dataSource 重叠/相似的值，防止把
+    //    数据源名误认成数据库名——文件名第二段曾因此错成 dk_shard）
     if (!database || !dataSource) {
       const form = document.querySelector("form") || xpathNode(FORM_XPATH);
       if (form) {
@@ -117,9 +118,11 @@
           const value = el.tagName === "SELECT" ? el.options[el.selectedIndex]?.textContent : el.value;
           if (value?.trim()) values.push(value.trim());
         });
-        const unique = [...new Set(values)].filter(v => !/^(查询|执行|取消|确定|SQL)$/i.test(v));
+        const unique = [...new Set(values)].filter(v =>
+          !/^(查询|执行|取消|确定|SQL)$/i.test(v) &&
+          v !== dataSource && !dataSource.includes(v) && !v.includes("shard"));
         if (!dataSource) dataSource = unique.find(v => /source|实例|数据源|tdsql|mysql|prod|test/i.test(v)) || "";
-        if (!database) database = unique.find(v => /database|db|库|schema/i.test(v)) || "";
+        if (!database) database = unique.find(v => /database|schema|^\w+_dk\b/i.test(v)) || "";
       }
     }
 
@@ -291,6 +294,11 @@
       if (!ta) { sendResponse({ ok: false, error: "no inputarea" }); return true; }
       ta.focus();
       sendResponse({ ok: true });
+      return true;
+    }
+    if (msg.type === "yr-sql-get") {
+      // 读当前编辑器完整 SQL（手动查询结果帧到达时，编辑器里就是刚执行的 SQL）
+      sendResponse({ ok: true, sql: readMonacoText() });
       return true;
     }
     if (msg.type === "yr-verify-sql") {

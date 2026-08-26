@@ -153,14 +153,33 @@ function refreshCsvList() {
       return `<div class="csv-item" data-id="${e.id}" title="${escapeHtml(e.sql || e.name)}">
         <span class="csv-name">📄 ${escapeHtml(e.name)}</span>
         <span class="csv-rows">${e.rows} 行 · ${time}</span>
+        <button class="copy-btn csv-prompt-btn" data-name="${escapeHtml(e.name)}" title="复制让 Agent 读这个文件的 Prompt">🤖</button>
       </div>`;
     }).join('');
     csvList.querySelectorAll('.csv-item').forEach(el => {
-      el.onclick = () => {
+      el.onclick = (ev) => {
+        // 点复制按钮不触发行点击（下载）
+        if (ev.target.closest('.csv-prompt-btn')) return;
         chrome.runtime.sendMessage({ type: 'CSV_DOWNLOAD', id: Number(el.dataset.id) }, (r) => {
           if (chrome.runtime.lastError || !r || !r.ok) {
             console.warn('重新下载失败:', r && r.msg);
           }
+        });
+      };
+    });
+    csvList.querySelectorAll('.csv-prompt-btn').forEach(btn => {
+      btn.onclick = (ev) => {
+        ev.stopPropagation();
+        const id = Number(btn.closest('.csv-item').dataset.id);
+        chrome.runtime.sendMessage({ type: 'CSV_PROMPT', id }, (r) => {
+          if (chrome.runtime.lastError || !r || !r.ok) {
+            console.warn('prompt 失败:', r && r.msg);
+            return;
+          }
+          navigator.clipboard.writeText(r.prompt).then(() => {
+            btn.textContent = '✓';
+            setTimeout(() => { btn.textContent = '🤖'; }, 1500);
+          }).catch(() => {});
         });
       };
     });
