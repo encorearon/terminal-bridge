@@ -128,8 +128,13 @@ function installProxyDeps() {
   const registryArg = process.argv.find(a => a.startsWith("--registry="));
   const baseArgs = ["install", "--no-audit", "--no-fund"];
   const runNpm = (args) => {
-    console.log(c.dim(`  运行 npm ${args.join(" ")} ...`));
-    return spawnSync("npm", args, { cwd: proxyDir, stdio: "inherit" });
+    // Windows 的 npm 是 npm.cmd 批处理，spawn 不带 shell 无法启动
+    // （表现为"运行 npm install ..."后无任何输出直接失败，实测踩过）。
+    // shell:true 下走 cmd 解析；registry 参数先过白名单校验防 shell 注入。
+    const safeArgs = args.filter(a =>
+      !a.startsWith("--registry=") || /^--registry=https?:\/\/[\w.\-/:]+$/.test(a));
+    console.log(c.dim(`  运行 npm ${safeArgs.join(" ")} ...`));
+    return spawnSync("npm", safeArgs, { cwd: proxyDir, stdio: "inherit", shell: true });
   };
 
   let result;
@@ -147,9 +152,12 @@ function installProxyDeps() {
     }
   }
 
-  if (result.status !== 0) {
-    // 失败时给出明确的排查建议
-    console.error("");
+  if (result.status !== 0 || result.error) {
+    if (result.error) {
+      console.error(c.red("  ✗ 无法启动 npm：" + result.error.message));
+      console.error(c.yellow(`  手动修复：cd "${join(INSTALL_DIR, "proxy")}" && npm install`));
+      fail("npm 无法启动");
+    }
     console.error(c.red("  ✗ npm install 失败"));
     console.error(c.yellow("  常见原因和解决方法："));
     console.error("");
