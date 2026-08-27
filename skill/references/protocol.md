@@ -34,6 +34,33 @@ Yearning 页面必须先在 popup 的「Yearning 监听」列表中监听并选�
 WebSocket 结果帧。Yearning 结果帧是 opcode=2 二进制帧，解码后通常为
 `{ export, error, results, query_time, status, heartbeat, is_only }`。
 
+可选编排参数（执行顺序：切源 → 建查询 tab → 选库 → 注入 SQL → 点查询）：
+
+- `source`：目标数据源名。幂等：已在目标源（URL hash 一致）时直接成功不重复点击。
+  名称不确定时可用假名探测，失败报告带回全量候选。已验证清单：
+  dk-shard-0..7-tdsql-c / dk-prod-1-tdsql-c / dk-doris / dk-chat-1 / dk-livechat-1。
+- `database`：目标库（schema）。显式新建查询 tab 后打开 antd Select 下拉点选，
+  以重读 meta 的 database 值验证。零 SQL tab 状态自动降级为使用现有编辑器。
+  同样支持假名探测（失败带回 options 清单）。
+- `autoQuery`：默认 `true`。设为 `false` 进入 **prepare 模式**——写好 SQL 后
+  不点查询，挂起等待用户手动点「查 询」产生的结果帧；此模式超时默认 600s、
+  上限 1800s。适合「AI 备查、人点查询、结果回传继续干活」的协作流程。
+
+**只读白名单**：代理对下发的 SQL 强制校验（剥注释后逐条），仅放行
+SELECT/SHOW/DESC/EXPLAIN；命中 INTO OUTFILE/DUMPFILE/FOR UPDATE 等副作用子句
+同样拒绝。失败返回 `ok:false, error:"write-forbidden"`。yr-set 路径同受约束。
+
+prepare 模式示例：
+
+```json
+{ "type": "yr-run", "sql": "select * from t_order limit 10;", "source": "dk-prod-1-tdsql-c", "database": "dk1", "autoQuery": false, "timeoutMs": 600000, "tabId": 123 }
+```
+
+诊断消息（均只读）：
+
+- `yr-ping`（客户端 `ping`）：编辑器/按钮/Select 状态/切源入口/路由 hash
+- `yr-dom-probe`（客户端 `probe`）：`.ant-select` 与弹层的 DOM 结构、坐标、meta 现值
+
 ### 完整消息列表
 
 ### Agent → 代理

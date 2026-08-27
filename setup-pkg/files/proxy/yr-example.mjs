@@ -1,13 +1,18 @@
 // Yearning SQL 自动化客户端
 //
 // 用法：
-//   node yr-example.mjs ping                 # 探测编辑器/按钮
+//   node yr-example.mjs ping                 # 探测编辑器/按钮/Select/切源入口
 //   node yr-example.mjs "SELECT 1"           # 执行查询（注入+点查询+收结果）
 //   node yr-example.mjs "SELECT ..." 30000   # 指定超时 ms
 //   node yr-example.mjs "SELECT ..." 60000 --csv  # 结果另存 CSV（当前目录）
+//   node yr-example.mjs "SELECT ..." --prepare --db 库名 [--source 数据源名]
+//                                            # 只切源+建tab+选库+写SQL，不点查询；
+//                                            # 挂起等用户手动点「查 询」后收结果
 //
 // 多页面时用环境变量指定目标 tab：YEARNING_TAB_ID=123 node yr-example.mjs "..."
 // 不指定时使用 popup「Yearning 监听」列表中选中的页面。
+//
+// 安全：代理侧只读白名单，仅放行 SELECT/SHOW/DESC/EXPLAIN；写语句一律拒绝。
 //
 // 前置：Yearning 页面已开 + popup 已点「📡 监听当前 Yearning 页」；多页面时先选中目标 tab
 
@@ -19,6 +24,11 @@ import { cwd } from "node:process";
 
 const BRIDGE = process.env.BRIDGE || "ws://127.0.0.1:8787/ssh";
 const selectedTabId = process.env.YEARNING_TAB_ID ? Number(process.env.YEARNING_TAB_ID) : undefined;
+
+function flagValue(name, args) {
+  const i = args.indexOf(name);
+  return i >= 0 ? (args[i + 1] || "") : undefined;
+}
 
 function yrRun(msg, timeoutMs) {
   return new Promise((resolve) => {
@@ -77,9 +87,23 @@ function saveResultCsv(jsonText) {
 
 const mode = process.argv[2] || "ping";
 const csvExport = process.argv.includes("--csv");
+const cliSelector = process.argv.slice(3).find(a => !a.startsWith("-")) || "";
 
-if (mode === "ping") {
+if (mode === "probe") {
+  // 只读 DOM 探测：node yr-example.mjs probe [selector]
   const ws = new WebSocket(BRIDGE);
+  ws.on("open", () => ws.send(JSON.stringify({ type: "yr-dom-probe", reqId: randomBytes(4).toString("hex"), tabId: selectedTabId, selector: cliSelector })));
+  ws.on("message", (raw) => {
+    let m;
+    try { m = JSON.parse(raw.toString()); } catch { process.exit(1); }
+    if (m.type !== "result") return;
+    console.log(m.ok ? "✓ probe ok" : "✗ probe failed");
+    console.log(m.output || m.error || "");
+    process.exit(m.ok ? 0 : 1);
+  });
+  ws.on("error", (e) => { console.error("✗", e.message); process.exit(1); });
+  setTimeout(() => { console.error("✗ timeout"); process.exit(1); }, 8000);
+} else if (mode === "ping") {  const ws = new WebSocket(BRIDGE);
   ws.on("open", () => ws.send(JSON.stringify({ type: "yr-ping", reqId: randomBytes(4).toString("hex"), tabId: selectedTabId })));
   ws.on("message", (raw) => {
     let m;
@@ -94,9 +118,21 @@ if (mode === "ping") {
 } else {
   const cliArgs = process.argv.slice(2).filter(a => a !== "--csv");
   const sql = cliArgs[0];
-  const timeoutMs = Number(cliArgs[1] || 60000);
-  console.log(`→ yr-run${selectedTabId ? ` [tab ${selectedTabId}]` : ""}: ${sql.slice(0, 100)}`);
-  const r = await yrRun({ sql, timeoutMs }, timeoutMs);
+  const prepare = cliArgs.includes("--prepare");
+  const database = flagValue("--db", cliArgs);
+  const source = flagValue("--source", cliArgs);
+  // 超时只认纯数字位置参数（第 2 个位置起），跳过 --db/--source 及其值
+  const numericArg = cliArgs.slice(1).find(a => /^\d+$/.test(a));
+  const timeoutMs = Number(numericArg || (prepare ? 600000 : 60000));
+  // prepare 模式默认等用户点查询，client 兜底超时要与等待时限同量级
+  if (prepare && !cliArgs[1]) {
+    console.log(`→ prepare 模式：最多等待 ${timeoutMs / 1000}s 用户点「查 询」`);
+  }
+  const runMsg = { sql, timeoutMs, autoQuery: !prepare };
+  if (database) runMsg.database = database;
+  if (source) runMsg.source = source;
+  console.log(`→ yr-run${prepare ? " [prepare]" : ""}${database ? ` [db ${database}]` : ""}${source ? ` [source ${source}]` : ""}${selectedTabId ? ` [tab ${selectedTabId}]` : ""}: ${sql.slice(0, 100)}`);
+  const r = await yrRun(runMsg, timeoutMs);
   if (r.ok) {
     console.log(`✓ ok (${r.elapsedMs}ms)`);
     if (csvExport) saveResultCsv(r.output);

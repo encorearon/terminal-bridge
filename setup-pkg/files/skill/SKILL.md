@@ -50,6 +50,19 @@ Arthas 的能力不止于读，以下命令/用法一律禁止通过桥接执行
 
 **Arthas 命令的默认判定**：若命令语法同时支持读和写（如 `vmoption`、`logger`、`ognl`），**默认视为写操作禁止**，只有当且仅当命令形态确认是只读时才允许。
 
+### Yearning 侧——禁止清单
+
+| 类别 | 禁止的 SQL/操作 | 为什么 |
+|------|----------------|--------|
+| 数据写 | `INSERT` / `UPDATE` / `DELETE` / `REPLACE` / `MERGE` | 改业务数据 |
+| 结构写 | `CREATE` / `ALTER` / `DROP` / `TRUNCATE` / `RENAME` | 改表结构 |
+| 事务/锁 | `SET`、`USE`、`LOCK`、`SELECT ... FOR UPDATE` | 改会话状态或锁行 |
+| 服务端副作用 | `SELECT ... INTO OUTFILE/DUMPFILE`、`LOAD_FILE()` | 在数据库服务器上读写文件 |
+
+代理已内置只读白名单（仅放行 SELECT/SHOW/DESC/EXPLAIN），写语句会在代理层直接
+返回 `error:"write-forbidden"`。Agent 收到该错误不要换写法绕过（注释混淆、拆分
+语句等），直接走「用户手动执行」路径。
+
 ### 当用户要求写操作时——标准应对
 
 1. **不要执行，也不要"先执行再看看"**。直接拒绝并说明：桥接是只读诊断通道，写操作需手动。
@@ -229,6 +242,66 @@ Arthas 直接挂在线上 JVM 上，命令不当会拖垮服务。代理内置�
 |------|------|------|
 | `ARTHAS_MAX_MEDIUM` | 20 | 中风险命令会话内最大次数 |
 | `ARTHAS_AUTO_PATCH` | 1 | 中风险命令缺限制时：1=自动补 `-n 1`，0=拒绝让 Agent 显式补 |
+
+## Yearning SQL 查询与「备查」协作模式
+
+Yearning（sql.meiyunji.net）页面在 popup「Yearning 监听」里监听并选中后，Agent 可以查数据：
+
+```bash
+cd ~/.terminal-bridge/proxy
+
+# 自动执行：注入 + 点查询 + 收结果
+node yr-example.mjs "show index from t_dk_message__8;" 30000 --csv
+# 指定库/数据源：先切源 → 新建查询 tab → 选 schema → 注入 → 点查询
+node yr-example.mjs "select * from t_order limit 10;" --db dk_order_3 --source dk-test-3 --csv
+# 诊断页面状态（只读）：编辑器/按钮/Select/切源入口/路由
+node yr-example.mjs ping
+node yr-example.mjs probe
+```
+
+### 已知环境（实测 2026-08）
+
+- **数据源清单**（「切换数据源」弹层全量）：`dk-shard-0..7-tdsql-c`、`dk-prod-1-tdsql-c`、`dk-doris`、`dk-chat-1`、`dk-livechat-1`
+- **中心库**：`dk-prod-1-tdsql-c` 的中心库是 `dk1`（其余为 xxl_job 调度库等）；分库分表源（dk-shard-*）内是 `dk_shard`
+- 用户说"xxx 分库"通常指某个 dk-shard-N 源；说"中心库/主库"通常指 dk-prod-1 的 dk1
+
+### 名称不确定时：假名探测（零副作用）
+
+源名/库名拿不准时，用假名跑一次，失败报告会带回**全量候选清单**（弹层会自动关闭）：
+
+```bash
+node yr-example.mjs "select 1;" --source zz_probe --db zz_probe --prepare
+# db-select failed: 下拉中无匹配的库 ... "options":["information_schema","dk1","xxl_job","xxl_job_prod2"]
+```
+
+拿到清单后按语义选目标（如中心库=dk1），再用真名重跑。
+
+### prepare 模式：AI 备查，人点查询（推荐协作流）
+
+用户说"帮我查 xxx 库下 xxx 表的数据"时：
+
+1. **Agent 备好一切但不执行**：
+   ```bash
+   node yr-example.mjs "select ... from t_shop where puid=... limit 20;" --source dk-prod-1-tdsql-c --db dk1 --prepare
+   ```
+   命令依次：切数据源（已在目标源时自动跳过）→ 新建查询 tab（零 tab 状态自动降级用现有编辑器）→
+   antd 下拉选 schema → CDP 注入 SQL → **不点查询**，挂起等待
+   （默认最长 10 分钟，`--prepare` 后可再传超时 ms，上限 30 分钟）。
+2. **告知用户**：「SQL 已就绪，请在 Yearning 页面点击『查 询』」。
+3. **阻塞等待结果帧**。用户点查询后结果自动回传（同一条命令的 stdout 返回 JSON），
+   CSV 同时进 popup 列表；期间可随时向用户同步进度。
+4. **兜底**：若等待超时/连接断开，结果也会以 CSV 形式落在 popup 列表
+   （`~/Downloads/yearning-csv/`），可用 popup 的复制按钮拿到读文件提示词继续干活。
+
+编排失败快速返回明确错误：`source-switch failed`（含候选清单）、`db-select failed`
+（含 options 清单）、`write-forbidden`（只读白名单拦截）、`no tap tab`（需 popup 重新监听选中）。
+
+### 运维注意
+
+- **代理重启会丢内存态**（active Yearning tab 等）：重启后让用户在 popup 重新点选监听页
+- **切源是页面路由切换**（hash 变化），CDP attach 不受影响，tap 监听持续有效
+- **改插件代码后**必须 `chrome://extensions ↻` **再 F5 页面**再 popup 重新选中，
+  顺序不能反；popup 标题旁的版本号可快速确认加载的是否最新代码
 
 ## 消息格式
 

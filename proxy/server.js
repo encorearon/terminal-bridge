@@ -23,6 +23,9 @@ import {
   auditArthasCommand,
   isArthasCommand,
 } from "./arthas-guard.js";
+import {
+  validateReadonlySql,
+} from "./yr-sql-guard.js";
 
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || "127.0.0.1";
@@ -80,6 +83,7 @@ function broadcastTap(payload) {
         url,
         data: payload.data,
         opcode: payload.opcode,
+        dir: payload.dir,   // sent=上行(客户端→服务器)/recv=下行，探针观测口
         t: payload.t
       }));
     } catch {}
@@ -95,18 +99,27 @@ function broadcastTap(payload) {
 const yrCmdWaiters = new Map();  // reqId -> resolve
 const yrRunWaiters = new Set();  // { tryConsume(payload) -> boolean }
 
-function sendYrCmd(sub, sql, tabId) {
+// sub → 配对超时：db-select/source-switch 含点击+枚举+验证的多轮往返，放宽到 25s
+const YR_CMD_TIMEOUT_MS = {
+  "db-select": 25000,
+  "source-switch": 25000,
+};
+const DEFAULT_YR_CMD_TIMEOUT_MS = 5000;
+
+function sendYrCmd(sub, sql, tabId, extra = {}) {
   const reqId = genReqId();
+  const timeoutMs = YR_CMD_TIMEOUT_MS[sub] || DEFAULT_YR_CMD_TIMEOUT_MS;
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       yrCmdWaiters.delete(reqId);
       resolve({ ok: false, error: `yr-cmd ${sub} timeout` });
-    }, 5000);
+    }, timeoutMs);
     yrCmdWaiters.set(reqId, (res) => {
       clearTimeout(timer);
       resolve(res);
     });
-    const ok = sendToExtension({ type: "yr-cmd", sub, sql, reqId, tabId });
+    // sub=new-sql/db-select/source-switch 时 sql 字段承载目标参数（库名/源名）
+    const ok = sendToExtension({ type: "yr-cmd", sub, sql, reqId, tabId, ...extra });
     if (!ok) {
       yrCmdWaiters.delete(reqId);
       clearTimeout(timer);
@@ -115,12 +128,15 @@ function sendYrCmd(sub, sql, tabId) {
   });
 }
 
-// 插件回的 yr-result：唤醒对应的 yr-cmd 等待者
+// 插件回的 yr-result：唤醒对应的 yr-cmd 等待者。
+// 控制字段外的全部业务负载（editor/buttons/sourceEntry/selects/hash 等）原样下发，
+// 让编排层与探测输出拿到完整的页面回执。
 function handleYrResult(msg) {
   const waiter = yrCmdWaiters.get(msg.reqId);
   if (waiter) {
     yrCmdWaiters.delete(msg.reqId);
-    waiter({ ok: !!msg.ok, via: msg.via, error: msg.error, info: msg.editor || msg.buttons });
+    const { type, reqId, tabId, ...payload } = msg;
+    waiter(payload);
   }
 }
 
@@ -174,21 +190,56 @@ async function handleYrRun(ws, msg) {
   const reqId = msg.reqId || genReqId();
   const sql = (msg.sql || "").toString();
   const tabId = msg.tabId != null ? Number(msg.tabId) : activeYearningTabId;
-  const timeoutMs = Math.min(Number(msg.timeoutMs || 60000), 300000);
+  const autoQuery = msg.autoQuery !== false;   // 默认自动点查询（兼容旧客户端）
+  const prepareMode = !autoQuery;
+  // prepare 模式等的是人点「查 询」，时限放宽；普通模式维持原上限
+  const timeoutCap = prepareMode ? 1800000 : 300000;
+  const timeoutDefault = prepareMode ? 600000 : 60000;
+  const timeoutMs = Math.min(Number(msg.timeoutMs || timeoutDefault), timeoutCap);
   if (!sql.trim()) {
     ws.send(JSON.stringify({ type: "result", reqId, ok: false, error: "empty sql" }));
     return;
   }
+  // 只读白名单：写操作在此拒绝，不进页面
+  const guard = validateReadonlySql(sql);
+  if (!guard.ok) {
+    console.warn(TAG, `[yr-run ${reqId}] SQL 白名单拦截: ${guard.error}`);
+    ws.send(JSON.stringify({ type: "result", reqId, ok: false, error: guard.error, message: guard.message }));
+    return;
+  }
+
+  // 编排失败快速返回：清理 waiter 后回错误
+  let settled = false;
+  let timer = null;
+  const failFast = (error, message) => {
+    if (settled) return true;
+    settled = true;
+    yrRunWaiters.delete(runEntry);
+    if (timer) clearTimeout(timer);
+    ws.send(JSON.stringify({ type: "result", reqId, ok: false, error, message }));
+    return true;
+  };
 
   // 结果帧等待者：收到第一个 results 非空帧即完成
-  let settled = false;
+  const sentAt = Date.now();
   const runEntry = {
     tabId,
-    sentAt: Date.now(),
+    ws,
+    sentAt,
+    abort: () => {
+      // 客户端断开时由 ws close 调用：停定时器并摘除，防死 waiter 残留
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      yrRunWaiters.delete(runEntry);
+    },
     tryConsume: (obj) => {
-      if (settled) return true;
+      // 已完成的 waiter 必须返回 false 放行——返回 true 会"假消费"，
+      // 把后续新 waiter 的结果帧截走饿到超时（死客户端残留时实测踩过）
+      if (settled) return false;
       settled = true;
       yrRunWaiters.delete(runEntry);
+      clearTimeout(timer);
       console.log(TAG, `[yr-run ${reqId}] 结果帧到达（query_time=${obj.query_time ?? "?"}）`);
       // 同步发给插件：浏览器侧生成 CSV 落下载（popup 可见、可重新下载）
       sendToExtension({
@@ -204,54 +255,80 @@ async function handleYrRun(ws, msg) {
       ws.send(JSON.stringify({
         type: "result", reqId, ok: true,
         output: JSON.stringify(obj),
-        elapsedMs: Date.now() - runEntry.sentAt,
+        elapsedMs: Date.now() - sentAt,
       }));
       return true;
     },
   };
   yrRunWaiters.add(runEntry);
 
-  const timer = setTimeout(() => {
+  timer = setTimeout(() => {
     if (settled) return;
     settled = true;
     yrRunWaiters.delete(runEntry);
     ws.send(JSON.stringify({
       type: "result", reqId, ok: false, error: "timeout",
-      message: "Yearning 查询未在时限内返回结果帧（确认页面已点「监听当前页 WS」且查询能正常执行）",
-      elapsedMs: Date.now() - runEntry.sentAt,
+      message: prepareMode
+        ? "prepare 模式超时：仍在等待用户点「查 询」后产生的结果帧"
+        : "Yearning 查询未在时限内返回结果帧（确认页面已点「监听当前页 WS」且查询能正常执行）",
+      elapsedMs: Date.now() - sentAt,
     }));
   }, timeoutMs);
 
-  // 1. 注入 SQL
-  const setRes = await sendYrCmd("sql-set", sql, tabId);
-  if (!setRes.ok) {
-    if (!settled) {
-      settled = true;
-      yrRunWaiters.delete(runEntry);
-      clearTimeout(timer);
-      ws.send(JSON.stringify({ type: "result", reqId, ok: false, error: "sql-set failed: " + (setRes.error || ""), message: "SQL 注入 Yearning 编辑器失败" }));
+  // 1. 可选：切数据源（目标名经由 yr-cmd 的 sql 字段携带）
+  if (msg.source) {
+    const srcRes = await sendYrCmd("source-switch", String(msg.source), tabId);
+    if (!srcRes.ok && !failFast(
+      "source-switch failed: " + (srcRes.error || ""),
+      `切换数据源 ${msg.source} 失败；现场证据: ${JSON.stringify(srcRes).slice(0, 800)}`
+    )) {
+      return;
     }
+    console.log(TAG, `[yr-run ${reqId}] 已切数据源 → ${msg.source}（via ${srcRes.via}）`);
+  }
+
+  // 2. 指定目标库时：先显式新建查询 tab 并把 schema 选好，
+  //    再注入 SQL（bg 对空库有 database-not-selected 预检，顺序不能反）
+  let skipNew = false;
+  if (msg.database) {
+    const newRes = await sendYrCmd("new-sql", "", tabId);
+    if (!newRes.ok) {
+      // 零 SQL tab 状态下页面没有「新建」按钮（实测清空 tab 后触发），
+      // 此时本就有现成编辑器——跳过新建直接注入，其余错误照旧快速失败
+      if (String(newRes.error || "").includes("新建按钮未找到")) {
+        console.warn(TAG, `[yr-run ${reqId}] 无「新建」按钮（零 tab 状态），使用当前编辑器`);
+      } else if (!failFast("new-sql failed: " + (newRes.error || ""), "新建查询 tab 失败")) {
+        return;
+      }
+    }
+    const dbRes = await sendYrCmd("db-select", String(msg.database), tabId);
+    if (!dbRes.ok && !failFast(
+      "db-select failed: " + (dbRes.error || ""),
+      `选择数据库 ${msg.database} 失败；现场证据: ${JSON.stringify(dbRes).slice(0, 800)}`
+    )) return;
+    console.log(TAG, `[yr-run ${reqId}] 已选库 → ${msg.database}`);
+    skipNew = true;  // 已建过 tab（或零 tab 状态），sql-set 不再重复新建
+  }
+
+  // 3. 注入 SQL
+  const setRes = await sendYrCmd("sql-set", sql, tabId, { skipNew });
+  if (!setRes.ok && !failFast("sql-set failed: " + (setRes.error || ""), "SQL 注入 Yearning 编辑器失败")) {
     return;
   }
   console.log(TAG, `[yr-run ${reqId}] SQL 已注入（via ${setRes.via}）`);
 
-  // 2. 点「查询」
+  // 4. 点「查询」（autoQuery=false 时留给人点）
+  if (prepareMode) {
+    console.log(TAG, `[yr-run ${reqId}] prepare 完成，等待用户点「查 询」（timeout ${timeoutMs}ms）...`);
+    return;
+  }
   const clickRes = await sendYrCmd("query-click", "", tabId);
-  if (!clickRes.ok) {
-    if (!settled) {
-      settled = true;
-      yrRunWaiters.delete(runEntry);
-      clearTimeout(timer);
-      ws.send(JSON.stringify({
-        type: "result", reqId, ok: false,
-        error: "query-click failed: " + (clickRes.error || ""),
-        message: "未找到「查询」按钮；页面按钮: " + JSON.stringify(clickRes.info || []).slice(0, 300),
-      }));
-    }
+  if (!clickRes.ok && !failFast("query-click failed: " + (clickRes.error || ""),
+    "未找到「查询」按钮；页面按钮: " + JSON.stringify(clickRes.info || []).slice(0, 300))) {
     return;
   }
   console.log(TAG, `[yr-run ${reqId}] 已点「查询」（via ${clickRes.via}），等待结果帧...`);
-  // 3. 结果帧由 feedYearningWaiters 消费（timer 兜底）
+  // 5. 结果帧由 feedYearningWaiters 消费（timer 兜底）
 }
 
 // ===================== 请求-响应配对 =====================
@@ -892,16 +969,29 @@ wss.on("connection", (ws, req) => {
       return;
     }
     if (msg.type === "yr-ping") {
-      // 探测：编辑器类型 + 查询按钮（不执行任何操作）
+      // 探测：编辑器类型 + 查询按钮 + Select/切源入口/路由（不执行任何操作）
       sendYrCmd("ping", "", msg.tabId != null ? Number(msg.tabId) : activeYearningTabId).then(r => {
-        ws.send(JSON.stringify({ type: "result", reqId: msg.reqId || "", ok: r.ok, output: JSON.stringify({ via: r.via, error: r.error, info: r.info }, null, 1) }));
+        ws.send(JSON.stringify({ type: "result", reqId: msg.reqId || "", ok: r.ok, output: JSON.stringify(r, null, 1) }));
       });
       return;
     }
     if (msg.type === "yr-set") {
       // 只注入 SQL 不点查询（用户手动点，配合 tap 探针收结果）
+      const guard = validateReadonlySql(msg.sql || "");
+      if (!guard.ok) {
+        ws.send(JSON.stringify({ type: "result", reqId: msg.reqId || "", ok: false, error: guard.error, output: guard.message }));
+        return;
+      }
       sendYrCmd("sql-set", msg.sql || "", msg.tabId != null ? Number(msg.tabId) : activeYearningTabId).then(r => {
         ws.send(JSON.stringify({ type: "result", reqId: msg.reqId || "", ok: r.ok, output: JSON.stringify({ via: r.via, error: r.error }) }));
+      });
+      return;
+    }
+
+    if (msg.type === "yr-dom-probe") {
+      // 只读 DOM 探测：Select/下拉/弹窗结构（诊断未知 UI 用）
+      sendYrCmd("dom-probe", String(msg.selector || ""), msg.tabId != null ? Number(msg.tabId) : activeYearningTabId).then(r => {
+        ws.send(JSON.stringify({ type: "result", reqId: msg.reqId || "", ok: r.ok, output: JSON.stringify(r, null, 1) }));
       });
       return;
     }
@@ -965,6 +1055,13 @@ wss.on("connection", (ws, req) => {
     clients.delete(ws);
     if (tapClients.delete(ws)) {
       console.log(TAG, `tap client 已断开 (total=${tapClients.size})`);
+    }
+    // 客户端断开即摘除其 yr-run 等待者，防止死 waiter 残留截走后续结果帧
+    for (const waiter of [...yrRunWaiters]) {
+      if (waiter.ws === ws) {
+        waiter.abort();
+        console.log(TAG, `[yr-run] 等待者随客户端断开移除 (剩余 ${yrRunWaiters.size})`);
+      }
     }
     if (ws === extensionWs) {
       extensionWs = null;

@@ -326,6 +326,9 @@ document.getElementById('btnCopyInstall').onclick = () => {
 setInterval(() => { refreshXterm(); refreshProxy(); refreshCsvList(); refreshYearningTabs(); }, 3000);
 refreshXterm();
 refreshProxy();
+// 版本号显性化：与 manifest 一致，排查"加载的是不是最新代码"
+try { document.getElementById('extVersion').textContent = 'v' + chrome.runtime.getManifest().version; } catch {}
+
 // 启动时主动探测一次 native host：发个 status，失败就显示安装提示
 chrome.runtime.sendMessage({ type: 'PROXY_STATUS' }, (res) => {
   if (isNativeHostMissing(res)) showInstallHint(true);

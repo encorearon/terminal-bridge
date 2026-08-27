@@ -24,6 +24,7 @@ mkdir -p "$FILES_DIR"/{proxy,native,extension,skill/references}
 echo "→ proxy/"
 cp "$PROJECT_DIR"/proxy/server.js "$FILES_DIR/proxy/"
 cp "$PROJECT_DIR"/proxy/arthas-guard.js "$FILES_DIR/proxy/"
+cp "$PROJECT_DIR"/proxy/yr-sql-guard.js "$FILES_DIR/proxy/"
 cp "$PROJECT_DIR"/proxy/client-example.mjs "$FILES_DIR/proxy/"
 cp "$PROJECT_DIR"/proxy/tap-example.mjs "$FILES_DIR/proxy/"
 cp "$PROJECT_DIR"/proxy/yr-example.mjs "$FILES_DIR/proxy/"
@@ -57,7 +58,7 @@ cp "$PROJECT_DIR"/skill/references/protocol.md "$FILES_DIR/skill/references/"
 # skill 安装时释放到 ~/.agents/skills/jumpserver-term-bridge/，让 Agent 自动发现
 
 # 校验关键文件都在
-for f in proxy/server.js proxy/arthas-guard.js native/install.sh native/host.sh.template \
+for f in proxy/server.js proxy/arthas-guard.js proxy/yr-sql-guard.js native/install.sh native/host.sh.template \
          extension/manifest.json extension/background.js extension/content.js extension/content-yearning.js extension/content-yearning-main.js extension/popup.html extension/popup.js \
          skill/SKILL.md skill/references/protocol.md; do
   if [ ! -f "$FILES_DIR/$f" ]; then

@@ -9,6 +9,8 @@
 // content script：在 koko connect iframe 里运行（见 manifest content_scripts）
 
 // ================= 状态 =================
+// 版本显性化：service worker 每次启动打印，便于确认 Chrome 加载的是最新构建
+console.log("[bg] Terminal Bridge v" + chrome.runtime.getManifest().version + " service worker 启动");
 const attached = {};  // 标记哪些 tab 当前已 attach debugger
 const BRIDGE_WS = "ws://127.0.0.1:8787/ssh";
 let bridgeWs = null;
@@ -376,7 +378,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     }
   }
   else if (method === 'Network.webSocketFrameReceived') {
-    // recv 帧：终端激活 tab 的进代理配对；tap tab 的进代理 tap 通道（都带 url）
+    // recv 帧（下行）：终端激活 tab 的进代理配对；tap tab 的进代理 tap 通道（都带 url）
     sendToBridge({
       type: 'ws-recv',
       payload: {
@@ -384,11 +386,14 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
         opcode: params.response && params.response.opcode,
         url: wsUrls.get(params.requestId) || "",
         tabId,
+        dir: 'recv',
         t: Date.now()
       }
     });
   }
   else if (method === 'Network.webSocketFrameSent') {
+    // sent 帧（上行）：终端 tab 走调试用 ws-send；tap 页面的上行帧（如 Yearning
+    // 点「查 询」发出的 msgpack 请求）也走 tap 通道转发，dir=sent 供探针观测
     if (isActive) {
       sendToBridge({
         type: 'ws-send',
@@ -397,6 +402,19 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
           opcode: params.response && params.response.opcode,
           url: wsUrls.get(params.requestId) || "",
           tabId,
+          dir: 'sent',
+          t: Date.now()
+        }
+      });
+    } else if (isTap) {
+      sendToBridge({
+        type: 'ws-recv',
+        payload: {
+          data: extractPayloadData(params.response),
+          opcode: params.response && params.response.opcode,
+          url: wsUrls.get(params.requestId) || "",
+          tabId,
+          dir: 'sent',
           t: Date.now()
         }
       });
@@ -559,10 +577,11 @@ function handleBridgeCommand(frame) {
     return;
   }
 
-  // { type: "yr-cmd", sub: "ping"|"sql-set"|"query-click", sql, reqId }
+  // { type: "yr-cmd", sub, sql, reqId, tabId, skipNew }
   // Yearning 自动化：代理编排（yr-run），本插件转发到 tap tab 的 content script。
-  // sql-set 走 CDP Input.insertText（浏览器信任层级，monaco 等任何编辑器都接受）；
-  // 合成 paste/execCommand 对 monaco 无效（isTrusted=false 被忽略，实测）。
+  // sub: ping | sql-set | query-click | new-sql | db-select | source-switch
+  // 编排模式下代理已显式建过查询 tab 时，sql-set 带 skipNew=true 不再重复新建。
+  // 非 sql-set 子命令里 sql 字段承载目标参数（db-select 库名 / source-switch 源名）。
   if (frame.type === "yr-cmd") {
     const tabId = frame.tabId != null ? frame.tabId : activeTapTabId;
     if (tabId == null) {
@@ -570,11 +589,31 @@ function handleBridgeCommand(frame) {
       return;
     }
     if (frame.sub === "sql-set") {
-      yrSqlSetViaCDP(tabId, frame.sql || "", frame.reqId);
+      yrSqlSetViaCDP(tabId, frame.sql || "", frame.reqId, !!frame.skipNew);
       return;
     }
-    const payload = frame.sub === "ping" ? { type: "yr-ping" }
-      : { type: "yr-query-click" };
+    // 选库/切源由 bg 用 CDP 真实鼠标事件编排（合成事件对 antd 无效），不走 content 转发
+    if (frame.sub === "db-select") {
+      yearningSelectDatabase(tabId, frame.sql || "", frame.reqId);
+      return;
+    }
+    if (frame.sub === "source-switch") {
+      yearningSwitchSource(tabId, frame.sql || "", frame.reqId);
+      return;
+    }
+    const yrSubPayloads = {
+      ping: { type: "yr-ping" },
+      "query-click": { type: "yr-query-click" },
+      "new-sql": { type: "yr-new-sql" },
+      "db-select": { type: "yr-db-select", database: frame.sql },
+      "source-switch": { type: "yr-source-switch", target: frame.sql },
+      "dom-probe": { type: "yr-dom-probe", selector: frame.sql },
+    };
+    const payload = yrSubPayloads[frame.sub];
+    if (!payload) {
+      sendToBridge({ type: "yr-result", reqId: frame.reqId, tabId, ok: false, error: "unknown yr-cmd sub: " + frame.sub });
+      return;
+    }
     chrome.tabs.sendMessage(tabId, payload, { frameId: 0 }, (res) => {
       if (chrome.runtime.lastError) {
         sendToBridge({ type: "yr-result", reqId: frame.reqId, tabId, ok: false, error: "content script 无响应: " + chrome.runtime.lastError.message });
@@ -599,18 +638,221 @@ function handleBridgeCommand(frame) {
   }
 }
 
+// ===== Yearning 选库/切源：CDP 真实鼠标点击编排 =====
+// antd Select / 弹层对 content script 的合成 mousedown 不响应（实测下拉展不开），
+// 改用 CDP Input.dispatchMouseEvent 产生与真人一致的受信任点击：
+//   content script 只读定位元素坐标 / 枚举下拉、弹层选项；bg 负责按坐标真实点击。
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function replyYr(reqId, tabId, payload) {
+  sendToBridge({ type: "yr-result", reqId, tabId, ...payload });
+}
+
+async function cdpMouseClick(tabId, x, y) {
+  const opts = { x, y, button: "left", clickCount: 1 };
+  await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", { type: "mouseMoved", ...opts });
+  await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", { type: "mousePressed", ...opts });
+  await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", { type: "mouseReleased", ...opts });
+}
+
+async function cdpPressKey(tabId, key, code, keyCode) {
+  const base = { key, code, windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode };
+  await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", { type: "keyDown", ...base });
+  await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", { type: "keyUp", ...base });
+}
+
+async function ensureYearningAttach(tabId) {
+  if (!attached[tabId]) {
+    await new Promise(resolve => attachDebugger(tabId) ?? resolve());
+    await sleepMs(400);  // 等 Network.enable 完成
+  }
+}
+
+// 选库：点开 Select 下拉 → 枚举选项 → 点目标 → 重读 meta 验证
+async function yearningSelectDatabase(tabId, database, reqId) {
+  try {
+    await ensureYearningAttach(tabId);
+    const wanted = String(database || "").trim().replace(/\s+/g, "");
+    const loc = await sendFrameMessage(tabId, { type: "yr-locate", kind: "db-trigger" }, 0);
+    if (!loc?.ok || !loc.rect) {
+      replyYr(reqId, tabId, { ok: false, error: loc?.error || "库选择器未定位到" });
+      return;
+    }
+    // 分级展开尝试：①程序化 focus + ArrowDown（combobox 标准开法）
+    //              ②真实鼠标点击（antd 本应响应点击）③Alt+Down
+    const stages = [];
+    const focusRes = await sendFrameMessage(tabId, { type: "yr-focus-db" }, 0);
+    stages.push(`focus:${focusRes?.focused ? "hit" : (focusRes?.ok ? "miss" : "fail")}`);
+    let opts = null;
+    const pollOpen = async (times = 16) => {
+      for (let i = 0; i < times; i++) {
+        await sleepMs(150);
+        opts = await sendFrameMessage(tabId, { type: "yr-options" }, 0);
+        if (opts?.ready) return true;
+      }
+      return false;
+    };
+
+    if (focusRes?.ok) {
+      stages.push("arrowdown");
+      await cdpPressKey(tabId, "ArrowDown", "ArrowDown", 40);
+      if (!(await pollOpen())) {
+        // 关了？重新聚焦再来一次方向键
+        await sendFrameMessage(tabId, { type: "yr-focus-db" }, 0);
+        await cdpPressKey(tabId, "ArrowDown", "ArrowDown", 40);
+        if (!(await pollOpen())) {
+          stages.pop(); stages.push("arrowdown×2");
+        }
+      }
+    }
+    if (!opts?.ready) {
+      stages.push("click");
+      await cdpMouseClick(tabId, loc.rect.x, loc.rect.y);
+      if (!(await pollOpen())) {
+        // 点击后补一发方向键（此时焦点多半已被点击带到位）
+        await cdpPressKey(tabId, "ArrowDown", "ArrowDown", 40);
+        if (!(await pollOpen())) stages[stages.length - 1] = "click+down";
+      }
+    }
+    if (!opts?.ready) {
+      stages.push("alt-arrowdown");
+      await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", {
+        type: "keyDown", key: "ArrowDown", code: "ArrowDown",
+        windowsVirtualKeyCode: 40, nativeVirtualKeyCode: 40, modifiers: 1,
+      });
+      await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", {
+        type: "keyUp", key: "ArrowDown", code: "ArrowDown",
+        windowsVirtualKeyCode: 40, nativeVirtualKeyCode: 40, modifiers: 1,
+      });
+      if (!(await pollOpen())) stages[stages.length - 1] = "alt-arrowdown×";
+    }
+    if (!opts?.ready) {
+      const activeEl = await sendFrameMessage(tabId, { type: "yr-active-element" }, 0);
+      replyYr(reqId, tabId, {
+        ok: false,
+        error: "全部展开方式均失败",
+        rect: loc.rect,
+        activeElement: activeEl || null,
+        listboxInDom: opts?.listboxInDom,
+        stages,
+      });
+      return;
+    }
+    const hit = opts.options.find(o => o.text.replace(/\s+/g, "") === wanted)
+             || opts.options.find(o => o.text.replace(/\s+/g, "").includes(wanted));
+    if (!hit) {
+      replyYr(reqId, tabId, { ok: false, error: "下拉中无匹配的库", options: opts.options.map(o => o.text).slice(0, 30) });
+      return;
+    }
+    if (hit.disabled) {
+      replyYr(reqId, tabId, { ok: false, error: "目标库为禁用状态（无权限）", target: database });
+      return;
+    }
+    // 点选项：content script 在元素上直接派发鼠标事件（无坐标漂移；
+    // React onClick 监听根节点，合成冒泡事件有效）
+    const clicked = await sendFrameMessage(tabId, { type: "yr-db-click-option", database: wanted }, 0);
+    if (!clicked?.ok) {
+      replyYr(reqId, tabId, { ok: false, error: clicked?.error || "点击选项失败", options: clicked?.options });
+      return;
+    }
+    for (let i = 0; i < 12; i++) {
+      await sleepMs(200);
+      const meta = await sendFrameMessage(tabId, { type: "yr-meta" }, 0);
+      if (meta?.ok && meta.database && meta.database.replace(/\s+/g, "") === wanted) {
+        replyYr(reqId, tabId, { ok: true, via: "cdp-mouse", database: meta.database });
+        return;
+      }
+    }
+    const finalMeta = await sendFrameMessage(tabId, { type: "yr-meta" }, 0);
+    replyYr(reqId, tabId, {
+      ok: false,
+      error: "已点击选项但验证失败：form 实际库名与目标不符",
+      expect: database,
+      actual: finalMeta?.database || "",
+      options: opts.options.map(o => o.text).slice(0, 30),
+    });
+  } catch (err) {
+    replyYr(reqId, tabId, { ok: false, error: "db-select 异常: " + err.message });
+  }
+}
+
+// 切源：点「切换数据源」入口 → 弹层叶子项匹配目标 → 点击后以 hash 变化验证
+async function yearningSwitchSource(tabId, sourceName, reqId) {
+  try {
+    await ensureYearningAttach(tabId);
+    const wanted = String(sourceName || "").trim().replace(/\s+/g, "");
+    // 幂等：已在目标源上（hash 的 source 参数一致）直接返回成功，避免
+    // 重复点击后 hash 不变被误判为切换失败
+    const curHash0 = (await sendFrameMessage(tabId, { type: "yr-hash" }, 0))?.hash || "";
+    if (curHash0.includes("source=" + wanted)) {
+      replyYr(reqId, tabId, { ok: true, via: "already-on-source", hash: curHash0 });
+      return;
+    }
+    // 先 Escape 关掉可能残留的弹层（上次未命中的 modal 会挡住入口按钮坐标）
+    await cdpPressKey(tabId, "Escape", "Escape", 27);
+    await sleepMs(300);
+    const beforeHash = (await sendFrameMessage(tabId, { type: "yr-hash" }, 0))?.hash;
+    const loc = await sendFrameMessage(tabId, { type: "yr-locate", kind: "entry-button", arg: "切换数据源" }, 0);
+    if (!loc?.ok || !loc.rect) {
+      replyYr(reqId, tabId, { ok: false, error: "「切换数据源」入口按钮未找到" });
+      return;
+    }
+    await cdpMouseClick(tabId, loc.rect.x, loc.rect.y);
+    // 枚举弹层项（元素级，不依赖坐标可见性），命中后元素级派发点击
+    let srcItems = null;
+    let items = [];
+    for (let i = 0; i < 40; i++) {
+      await sleepMs(150);
+      srcItems = await sendFrameMessage(tabId, { type: "yr-source-items" }, 0);
+      items = srcItems?.items || [];
+      if (items.length > 0) break;
+    }
+    if (items.length === 0) {
+      await cdpPressKey(tabId, "Escape", "Escape", 27);
+      replyYr(reqId, tabId, {
+        ok: false,
+        error: "弹层未出现或无可选数据源项",
+        itemsDebug: srcItems?.debug || "no-response",
+      });
+      return;
+    }
+    const clicked = await sendFrameMessage(tabId, { type: "yr-source-click", target: wanted }, 0);
+    if (!clicked?.ok) {
+      await cdpPressKey(tabId, "Escape", "Escape", 27);
+      replyYr(reqId, tabId, { ok: false, error: clicked?.error || "点击数据源项失败", candidates: clicked?.candidates || items.slice(0, 30) });
+      return;
+    }
+    for (let i = 0; i < 24; i++) {
+      await sleepMs(250);
+      const nowHash = (await sendFrameMessage(tabId, { type: "yr-hash" }, 0))?.hash;
+      if (nowHash !== undefined && nowHash !== beforeHash) {
+        replyYr(reqId, tabId, { ok: true, via: "element-dispatch", clicked: clicked.clicked, hash: nowHash });
+        return;
+      }
+    }
+    const nowHash = (await sendFrameMessage(tabId, { type: "yr-hash" }, 0))?.hash;
+    await cdpPressKey(tabId, "Escape", "Escape", 27);
+    replyYr(reqId, tabId, { ok: false, error: "已点击候选但路由未变化（hash 不变）", clickedText: clicked.clicked, hash: nowHash });
+  } catch (err) {
+    replyYr(reqId, tabId, { ok: false, error: "source-switch 异常: " + err.message });
+  }
+}
+
 // Yearning SQL 通过 CDP Input 注入（monaco 等编辑器接受浏览器信任层级事件）
-async function yrSqlSetViaCDP(tabId, sql, reqId) {
+async function yrSqlSetViaCDP(tabId, sql, reqId, skipNew = false) {
   try {
     // 未 attach 的 tab 上 Input.* 命令会静默无效 → 注入校验失败，先确保 attach
     if (!attached[tabId]) {
       await new Promise(resolve => attachDebugger(tabId) ?? resolve());
       await new Promise(r => setTimeout(r, 400));  // 等 Network.enable 完成
     }
-    // 新建 SQL 窗口：避免把 SQL 注入用户正在使用的已有编辑器
-    const newWin = await sendFrameMessage(tabId, { type: "yr-new-sql" }, 0);
-    if (!newWin || !newWin.ok) {
-      console.warn("[bg] 新建 SQL 窗口失败（继续在当前编辑器注入）:", newWin?.error);
+    // 新建 SQL 窗口：避免把 SQL 注入用户正在使用的已有编辑器。
+    // 编排模式（代理已显式建过 tab 并选好库）由 skipNew 跳过。
+    if (!skipNew) {
+      const newWin = await sendFrameMessage(tabId, { type: "yr-new-sql" }, 0);
+      if (!newWin || !newWin.ok) {
+        console.warn("[bg] 新建 SQL 窗口失败（继续在当前编辑器注入）:", newWin?.error);
+      }
     }
     // 前置校验：数据库未选择时 Yearning 查询必报错，提前失败给明确提示
     const meta = await sendFrameMessage(tabId, { type: "yr-meta" }, 0);
