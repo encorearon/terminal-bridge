@@ -224,9 +224,19 @@ async function handleYrRun(ws, msg) {
   const sentAt = Date.now();
   const runEntry = {
     tabId,
+    ws,
     sentAt,
+    abort: () => {
+      // 客户端断开时由 ws close 调用：停定时器并摘除，防死 waiter 残留
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      yrRunWaiters.delete(runEntry);
+    },
     tryConsume: (obj) => {
-      if (settled) return true;
+      // 已完成的 waiter 必须返回 false 放行——返回 true 会"假消费"，
+      // 把后续新 waiter 的结果帧截走饿到超时（死客户端残留时实测踩过）
+      if (settled) return false;
       settled = true;
       yrRunWaiters.delete(runEntry);
       clearTimeout(timer);
@@ -1045,6 +1055,13 @@ wss.on("connection", (ws, req) => {
     clients.delete(ws);
     if (tapClients.delete(ws)) {
       console.log(TAG, `tap client 已断开 (total=${tapClients.size})`);
+    }
+    // 客户端断开即摘除其 yr-run 等待者，防止死 waiter 残留截走后续结果帧
+    for (const waiter of [...yrRunWaiters]) {
+      if (waiter.ws === ws) {
+        waiter.abort();
+        console.log(TAG, `[yr-run] 等待者随客户端断开移除 (剩余 ${yrRunWaiters.size})`);
+      }
     }
     if (ws === extensionWs) {
       extensionWs = null;
