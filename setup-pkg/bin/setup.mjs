@@ -126,19 +126,26 @@ function installProxyDeps() {
   // 支持 --registry 透传（国内网络/公司内网常用）
   // 用法：npx terminal-bridge-setup --registry=https://registry.npmmirror.com
   const registryArg = process.argv.find(a => a.startsWith("--registry="));
-  const npmArgs = ["install", "--no-audit", "--no-fund"];
-  if (registryArg) {
-    npmArgs.push(registryArg);
-    console.log(c.dim(`  使用 registry: ${registryArg.split("=")[1]}`));
-  } else {
-    npmArgs.push("--silent");
-  }
+  const baseArgs = ["install", "--no-audit", "--no-fund"];
+  const runNpm = (args) => {
+    console.log(c.dim(`  运行 npm ${args.join(" ")} ...`));
+    return spawnSync("npm", args, { cwd: proxyDir, stdio: "inherit" });
+  };
 
-  console.log(c.dim("  运行 npm install ..."));
-  const result = spawnSync("npm", npmArgs, {
-    cwd: proxyDir,
-    stdio: "inherit",
-  });
+  let result;
+  if (registryArg) {
+    console.log(c.dim(`  使用 registry: ${registryArg.split("=")[1]}`));
+    result = runNpm([...baseArgs, registryArg]);
+  } else {
+    // 不加 --silent：私有源缺包/认证失败等真实错误必须可见，不能吞掉
+    result = runNpm(baseArgs);
+    if (result.status !== 0) {
+      // 内网镜像未同步/缺包是高频原因（verdaccio 同步延迟实测踩过），
+      // 自动用官方源兜底重试一次再判失败
+      console.log(c.yellow("  默认 registry 安装失败，用官方源 npmjs.org 重试..."));
+      result = runNpm([...baseArgs, "--registry=https://registry.npmjs.org"]);
+    }
+  }
 
   if (result.status !== 0) {
     // 失败时给出明确的排查建议
