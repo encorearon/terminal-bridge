@@ -42,6 +42,33 @@ const step = (n, total, msg) => console.log(`\n${c.bold(c.cyan(`[${n}/${total}]`
 const STEPS = 5;
 
 // ===================== 步骤 1：释放文件 =====================
+// 升级安装前停掉旧代理实例：读 .proxy.pid 杀进程（跨平台 process.kill）。
+// 不停的话旧实例一直占 8787，新代理启动即 EADDRINUSE 异常退出（Windows 实测踩过）
+function stopOldProxy() {
+  const pidFile = join(INSTALL_DIR, "proxy", ".proxy.pid");
+  if (!existsSync(pidFile)) return;
+  let pid;
+  try {
+    pid = Number(String(readFileSync(pidFile, "utf8")).trim());
+  } catch { return; }
+  if (!Number.isInteger(pid) || pid <= 0) return;
+  try {
+    process.kill(pid, "SIGTERM");
+    console.log(c.yellow(`  已停止旧代理实例 (pid ${pid})`));
+    // 给旧进程一点退出时间，避免端口未释放
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline) {
+      try { process.kill(pid, 0); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100); }
+      catch { break; }  // 进程已退出
+    }
+  } catch (err) {
+    // ESRCH=进程不存在（正常）；EPERM=权限不足（尽力而为，不阻断安装）
+    if (err.code !== "ESRCH") {
+      console.log(c.yellow(`  旧代理 (pid ${pid}) 停止失败（${err.code || err.message}），如新代理启动报端口占用请手动结束 node 进程`));
+    }
+  }
+}
+
 function releaseFiles() {
   step(1, STEPS, `释放文件到 ${c.dim(INSTALL_DIR)}`);
 
@@ -54,10 +81,12 @@ function releaseFiles() {
   if (existsSync(INSTALL_DIR)) {
     if (isForce) {
       console.log(c.yellow("  已存在 ~/.terminal-bridge/，--force 模式：覆盖"));
+      stopOldProxy();
       rmSync(INSTALL_DIR, { recursive: true, force: true });
     } else {
       // 不强制覆盖时，仍然更新文件（保留 .proxy.pid/.proxy.log 等运行时产物）
       console.log(c.yellow("  ~/.terminal-bridge/ 已存在，将更新文件（运行时产物保留）"));
+      stopOldProxy();
     }
   }
 

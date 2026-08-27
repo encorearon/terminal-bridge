@@ -917,6 +917,17 @@ function finalizeOutput(entry) {
 
 // ===================== WebSocket 服务 =====================
 const wss = new WebSocketServer({ host: HOST, port: PORT });
+// 绑定失败（典型：升级安装时旧代理实例还在占端口）必须给出可读原因再退出，
+// 否则 Windows 上表现为"node 抛异常退出"，用户无从下手
+wss.on("error", (err) => {
+  if (err && err.code === "EADDRINUSE") {
+    console.error(TAG, `端口 ${PORT} 已被占用：很可能有一个旧代理实例还在运行。`);
+    console.error(TAG, "请先停止旧代理（插件 popup「停止代理」，或任务管理器结束对应 node 进程）后重试。");
+  } else {
+    console.error(TAG, "代理启动失败:", err && (err.stack || err.message || err));
+  }
+  process.exit(1);
+});
 
 wss.on("connection", (ws, req) => {
   const url = req.url || "/ssh";
