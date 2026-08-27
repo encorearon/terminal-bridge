@@ -107,13 +107,18 @@ function releaseFiles() {
 
 // ===================== 步骤 2：装代理依赖 =====================
 function installProxyDeps() {
-  step(2, STEPS, "安装代理依赖 (ws)");
+  step(2, STEPS, "安装代理依赖 (ws + @msgpack/msgpack)");
 
-  // 如果 node_modules/ws 已存在（从包里带出来的），跳过
+  // 跳过条件：两个依赖都存在才跳过。只查 ws 会漏掉 @msgpack/msgpack——
+  // 旧版本装的 node_modules 只有 ws，升级后代理启动即 ERR_MODULE_NOT_FOUND
   const wsPath = join(INSTALL_DIR, "proxy", "node_modules", "ws");
-  if (existsSync(wsPath)) {
-    ok("依赖已存在，跳过");
+  const msgpackPath = join(INSTALL_DIR, "proxy", "node_modules", "@msgpack", "msgpack");
+  if (existsSync(wsPath) && existsSync(msgpackPath)) {
+    ok("依赖已存在（ws + @msgpack/msgpack），跳过");
     return;
+  }
+  if (existsSync(wsPath) && !existsSync(msgpackPath)) {
+    console.log(c.yellow("  检测到 ws 存在但 @msgpack/msgpack 缺失（旧版本残留），补装"));
   }
 
   const proxyDir = join(INSTALL_DIR, "proxy");
@@ -153,7 +158,13 @@ function installProxyDeps() {
     console.error("");
     fail("npm install 失败（见上方排查建议）");
   }
-  ok("依赖安装完成");
+  // 装完验证两个依赖真实落盘（防 npm 静默半装/registry 缺包）
+  if (!existsSync(wsPath) || !existsSync(msgpackPath)) {
+    console.error(c.red("  ✗ 依赖验证失败：ws 或 @msgpack/msgpack 未落盘"));
+    console.error(c.yellow(`  手动修复：cd "${join(INSTALL_DIR, "proxy")}" && npm install`));
+    fail("依赖安装不完整");
+  }
+  ok("依赖安装完成（已验证 ws + @msgpack/msgpack）");
 }
 
 // ===================== 步骤 3：注册 native host =====================

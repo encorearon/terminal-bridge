@@ -13,7 +13,6 @@
 
 import { WebSocketServer } from "ws";
 import { randomBytes } from "node:crypto";
-import { decode as msgpackDecode } from "@msgpack/msgpack";
 import { writeFileSync, unlinkSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -33,6 +32,17 @@ const DEFAULT_TIMEOUT_MS = Number(process.env.DEFAULT_TIMEOUT_MS || 10000);
 const PROBE_LOG = process.env.PROBE_LOG !== "0"; // 默认开探针日志
 
 const TAG = "[proxy]";
+
+// msgpack 只有 Yearning 结果解析用到，终端桥接（JumpServer/Arthas）不需要。
+// 按需动态加载：缺依赖时降级为告警 + Yearning 功能不可用，而不是整个代理
+// 启动崩溃（Windows 用户 npm install 缺包时曾把终端功能一起拖死，实测踩过）。
+let msgpackDecode = null;
+try {
+  ({ decode: msgpackDecode } = await import("@msgpack/msgpack"));
+} catch {
+  console.warn(TAG, "⚠ @msgpack/msgpack 未安装：Yearning 查询结果解析不可用（终端命令不受影响）");
+  console.warn(TAG, "⚠ 修复：cd ~/.terminal-bridge/proxy && npm install");
+}
 
 // ===================== 客户端管理 =====================
 // 一个端点两类客户端：插件（唯一）和 Agent（多个）。
@@ -151,6 +161,7 @@ function feedYearningWaiters(payload) {
   const opcode = payload && payload.opcode;
   const data = payload && payload.data;
   if (opcode !== 2 || typeof data !== "string") return;
+  if (!msgpackDecode) return;  // msgpack 缺失时 Yearning 解析不可用（启动时已告警）
   let obj = null;
   try {
     obj = msgpackDecode(Buffer.from(data, "base64"));
