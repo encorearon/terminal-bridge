@@ -777,9 +777,22 @@ function clickDropdownOption(target) {
         });
         // 用与编排一致的定位逻辑回看"到底选中了哪个节点"
         const trigEl = findDbTrigger();
+        // 编辑器现场取证：焦点在哪、每个 monaco 的可见性与内容长度
+        const ae = document.activeElement;
+        const editors = [...document.querySelectorAll(".monaco-editor")].map(m => {
+          const r = m.getBoundingClientRect();
+          return {
+            visible: m.offsetParent !== null && r.width > 0 && r.height > 0,
+            rect: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) },
+            textLen: (m.querySelector(".view-lines")?.textContent || "").length,
+            inputareaFocused: document.activeElement === m.querySelector("textarea.inputarea"),
+          };
+        });
         sendResponse({
           ok: true,
           hash: location.hash,
+          activeElement: ae ? { cls: String(ae.className || "").slice(0, 80), id: ae.id || "", tag: ae.tagName } : null,
+          editors,
           selects: [...document.querySelectorAll(".ant-select")].map(selectDump),
           triggerLocated: trigEl ? selectDump(trigEl) : null,
           metaNow: readYearningMeta(),

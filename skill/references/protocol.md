@@ -50,6 +50,10 @@ WebSocket 结果帧。Yearning 结果帧是 opcode=2 二进制帧，解码后通
 SELECT/SHOW/DESC/EXPLAIN；命中 INTO OUTFILE/DUMPFILE/FOR UPDATE 等副作用子句
 同样拒绝。失败返回 `ok:false, error:"write-forbidden"`。yr-set 路径同受约束。
 
+**SQL 执行报错回传**：数据库拒绝 SQL 时（表不存在/权限不足等），Yearning 的
+错误帧会被捕获并立即返回 `ok:false, error:"sql-error", message:"SQL 被数据库拒绝：<原文>"`，
+不会等到超时。Agent 应按 message 修正 SQL 重试。
+
 prepare 模式示例：
 
 ```json

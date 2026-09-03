@@ -166,7 +166,12 @@ function feedYearningWaiters(payload) {
   try {
     obj = msgpackDecode(Buffer.from(data, "base64"));
   } catch { return; }
-  if (!obj || obj.results == null) return;  // 心跳帧忽略
+  if (!obj) return;
+  // 两类有效帧：正常结果（results 非空）/ SQL 执行报错（error 非空，results 为空）。
+  // 错误帧不接住的话 waiter 只能干等超时，Agent 无从得知 SQL 写错了
+  const hasResults = obj.results != null;
+  const hasError = typeof obj.error === "string" && obj.error.trim().length > 0;
+  if (!hasResults && !hasError) return;  // 心跳等噪音帧
 
   let consumed = false;
   if (yrRunWaiters.size > 0) {
@@ -181,8 +186,8 @@ function feedYearningWaiters(payload) {
   }
 
   // 未被 yr-run 消费的结果帧 = 手动查询（或 yr-run 已完成后的重复帧），
-  // 也生成 CSV 记录。同一帧 yr-run 路径已经发过 export，不重复。
-  if (!consumed) {
+  // 也生成 CSV 记录。错误帧没有数据，跳过导出。
+  if (!consumed && hasResults) {
     const rows = Array.isArray(obj.results)
       ? obj.results.map(t => (t && t.data ? t.data.length : 0)).reduce((a, b) => a + b, 0)
       : 0;
@@ -251,6 +256,18 @@ async function handleYrRun(ws, msg) {
       settled = true;
       yrRunWaiters.delete(runEntry);
       clearTimeout(timer);
+      // SQL 执行报错帧：把数据库错误原文带回给 Agent（不导 CSV，无数据可导）
+      const sqlError = typeof obj.error === "string" ? obj.error.trim() : "";
+      if (sqlError) {
+        console.log(TAG, `[yr-run ${reqId}] SQL 执行报错: ${sqlError.slice(0, 200)}`);
+        ws.send(JSON.stringify({
+          type: "result", reqId, ok: false, error: "sql-error",
+          message: "SQL 被数据库拒绝：" + sqlError,
+          output: JSON.stringify(obj),
+          elapsedMs: Date.now() - sentAt,
+        }));
+        return true;
+      }
       console.log(TAG, `[yr-run ${reqId}] 结果帧到达（query_time=${obj.query_time ?? "?"}）`);
       // 同步发给插件：浏览器侧生成 CSV 落下载（popup 可见、可重新下载）
       sendToExtension({

@@ -334,6 +334,8 @@ Agent → 代理：
 | 现象 | 原因 | 处理 |
 |------|------|------|
 | `error: extension not connected` | 代理没收到插件 hello | 检查插件是否启用、service worker 日志、代理是否在跑 |
+| `error: write-forbidden` | Yearning 只读白名单拦截（非 SELECT/SHOW/DESC/EXPLAIN） | 修正为只读语句重试；不要试图混淆绕过 |
+| `error: sql-error` | **SQL 被数据库拒绝**（message 带原文，如 `Table 'xxx' doesn't exist`、权限不足） | 按 message 修正 SQL 后重试；秒回不是超时 |
 | `error: sudo-required` | 命令触发 sudo 密码提示（alias 劫持，仅 JumpServer） | 按"sudo 自动重试"流程问用户是否切 root，确认后切 root 重发原命令 |
 | `error: arthas-forbidden` | Arthas 高风险命令（retransform/profiler/stop/reset）被禁用 | 告知用户去浏览器 Arthas 终端手动执行，不要重试或绕过 |
 | `error: arthas-needs-limit` | 中风险命令（trace/watch/stack/monitor）缺 -n/#cost（严格模式） | 按 suggest 补参数重发，或加 `-n 1` |
