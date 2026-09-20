@@ -846,12 +846,37 @@ async function yrSqlSetViaCDP(tabId, sql, reqId, skipNew = false) {
       await new Promise(resolve => attachDebugger(tabId) ?? resolve());
       await new Promise(r => setTimeout(r, 400));  // 等 Network.enable 完成
     }
+    // 把 Yearning 标签页带到前台：后台标签页的 Vue/monaco 渲染被 rAF 节流，
+    // 新建查询 tab 点了也不渲染 → SQL 会被追加到已有编辑器后面（严重 bug，实测）
+    try {
+      const yrTab = await chrome.tabs.get(tabId);
+      if (!yrTab.active) {
+        await chrome.tabs.update(tabId, { active: true });
+        if (yrTab.windowId != null) await chrome.windows.update(yrTab.windowId, { focused: true });
+        await sleepMs(500);  // 等页面从节流中恢复渲染
+        console.log("[bg] Yearning 标签页已带到前台（原为后台）");
+      }
+    } catch (err) {
+      console.warn("[bg] 激活 Yearning 标签页失败（继续注入）:", err?.message);
+    }
     // 新建 SQL 窗口：避免把 SQL 注入用户正在使用的已有编辑器。
     // 编排模式（代理已显式建过 tab 并选好库）由 skipNew 跳过。
     if (!skipNew) {
       const newWin = await sendFrameMessage(tabId, { type: "yr-new-sql" }, 0);
       if (!newWin || !newWin.ok) {
         console.warn("[bg] 新建 SQL 窗口失败（继续在当前编辑器注入）:", newWin?.error);
+      }
+      // 安全护栏：新建失败且现有编辑器非空时绝不注入——宁可失败也不能把 SQL
+      // 追加到用户已有语句后面（后台节流场景实测踩过）
+      const cur = await sendFrameMessage(tabId, { type: "yr-sql-get" }, 0);
+      if (cur?.ok && (cur.sql || "").trim().length > 0) {
+        sendToBridge({
+          type: "yr-result", reqId, tabId, ok: false,
+          error: "editor-not-empty",
+          message: "新建查询 tab 未生效且当前编辑器已有内容，为避免把 SQL 追加到你现有语句后面已中止。请切到 Yearning 页面确认后重试（或先清空/关闭已有 SQL tab）。",
+          editorText: (cur.sql || "").slice(0, 120),
+        });
+        return;
       }
     }
     // 前置校验：数据库未选择时 Yearning 查询必报错，提前失败给明确提示

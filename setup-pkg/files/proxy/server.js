@@ -619,6 +619,25 @@ function detectTerminalType(text) {
 }
 
 // 插件上报的 ws-recv 帧
+// OrcaTerm（腾讯云 TKE 容器终端等）用 JSON 文本帧包裹终端流：
+//   {"type":"data","data":"<带 ANSI 的真实终端明文>","sessionId":"..."}
+// 且一帧内可能拼接多个 JSON 对象。解包取 data 字段；其他类型帧（心跳等）丢弃。
+function extractOrcaTermData(text) {
+  if (typeof text !== "string" || text.indexOf('{"type"') === -1) return text;
+  let out = "";
+  let buf = "";
+  for (const ch of text) {
+    buf += ch;
+    if (ch !== "}") continue;
+    try {
+      const obj = JSON.parse(buf);
+      buf = "";
+      if (obj && obj.type === "data" && typeof obj.data === "string") out += obj.data;
+    } catch { /* 还没凑齐一个完整 JSON，继续累积 */ }
+  }
+  return out;
+}
+
 function handleWsRecv(payload) {
   const data = payload && payload.data;
   const opcode = payload && payload.opcode;
@@ -646,6 +665,9 @@ function handleWsRecv(payload) {
   } else {
     text = typeof data === "string" ? data : String(data);
   }
+
+  // OrcaTerm JSON 包裹帧解包（koko 无此包裹，indexOf 快速跳过零开销）
+  text = extractOrcaTermData(text);
 
   // 给当前 pending（同时只会有一个）喂帧，按 prompt 锚点状态机处理
   for (const [reqId, entry] of pending) {
@@ -1062,7 +1084,10 @@ wss.on("connection", (ws, req) => {
       // 防止 tap 页面（Yearning JSON 帧）污染终端命令的输出配对。
       broadcastTap(msg.payload);
       const frameUrl = (msg.payload && msg.payload.url) || "";
-      const isTerminalUrl = !frameUrl || /\/koko\/ws|connectArthas/i.test(frameUrl);
+      // 终端白名单：koko（JumpServer）/ Arthas / 腾讯云 OrcaTerm（TKE 容器终端，
+      // JSON 文本帧由 extractOrcaTermData 解包）。空 URL 也接受（attach 前建立的
+      // 连接拿不到 webSocketCreated，帧没有 url）
+      const isTerminalUrl = !frameUrl || /\/koko\/ws|connectArthas|orcaterm/i.test(frameUrl);
       if (isTerminalUrl) handleWsRecv(msg.payload);
       return;
     }
